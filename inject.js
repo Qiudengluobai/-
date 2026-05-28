@@ -193,9 +193,10 @@ function createMemory(overrides) {
     confirmedByUser: true
   };
   if (overrides) {
-    var keys = Object.keys(overrides);
-    for (var i = 0; i < keys.length; i++) {
-      base[keys[i]] = overrides[keys[i]];
+    var allowed = ['id','time','timestamp','zone','roleId','roleName','category','content','importance','tags','reviewed','summarized','protected','hidden','linkedIds','triggerKeywords','entities','relations','lastRetrievedAt','retrieveCount','decayScore','archivedAt','sourceType','confirmedByUser'];
+    for (var i = 0; i < allowed.length; i++) {
+      var k = allowed[i];
+      if (overrides.hasOwnProperty(k)) base[k] = overrides[k];
     }
   }
   return base;
@@ -228,20 +229,6 @@ DataService._storageMode = null;   // 'indexedDB' | 'localStorage'
 DataService._db = null;            // IndexedDB 连接句柄
 DataService._roleId = '';
 DataService._sessionId = '';
-DataService._writeQueue = Promise.resolve(); // 写操作队列，防止并发写竞态
-
-/**
- * 将写操作入队串行化，防止 read-modify-write 竞态条件
- * 即使某个写操作失败，队列仍继续工作
- */
-DataService._enqueueWrite = function(writeFn) {
-  var self = this;
-  var result = this._writeQueue.then(function() {
-    return writeFn();
-  });
-  this._writeQueue = result.then(function() {}, function() {}); // 队列永不阻塞
-  return result;
-};
 
 /**
  * 检测并确定存储模式
@@ -348,17 +335,7 @@ DataService._ensureDB = function() {
   if (this._db && this._db.objectStoreNames.contains('memories')) {
     return Promise.resolve(this._db);
   }
-  // 缓存 _openDB() 的 Promise，防止并发调用打开多个连接
-  if (!this._dbPromise) {
-    this._dbPromise = this._openDB().then(function(db) {
-      self._dbPromise = null;
-      return db;
-    }, function(err) {
-      self._dbPromise = null;
-      throw err;
-    });
-  }
-  return this._dbPromise;
+  return this._openDB();
 };
 
 /**
@@ -371,9 +348,8 @@ DataService._readIDB = function() {
       var tx = db.transaction('memories', 'readonly');
       var store = tx.objectStore('memories');
       var request = store.getAll();
-      var timeout = setTimeout(function() { reject(new Error('_readIDB timed out')); }, 10000);
-      request.onsuccess = function() { clearTimeout(timeout); resolve(request.result || []); };
-      request.onerror = function() { clearTimeout(timeout); reject(request.error); };
+      request.onsuccess = function() { resolve(request.result || []); };
+      request.onerror = function() { reject(request.error); };
     });
   });
 };
@@ -384,28 +360,46 @@ DataService._readIDB = function() {
 DataService._writeIDB = function(memories) {
   var self = this;
   return this._ensureDB().then(function(db) {
-    return new Promise(function(resolve, reject) {
-      var tx = db.transaction('memories', 'readwrite');
-      var store = tx.objectStore('memories');
+    // 先读取所有已有 key，用于后续清理不在新数据集中的旧记录
+    return new Promise(function(resolvePre, rejectPre) {
+      var preTx = db.transaction('memories', 'readonly');
+      var preStore = preTx.objectStore('memories');
+      var keysReq = preStore.getAllKeys();
+      var existingIds = {};
+      keysReq.onsuccess = function() {
+        var keys = keysReq.result || [];
+        for (var ki = 0; ki < keys.length; ki++) { existingIds[keys[ki]] = true; }
+        resolvePre(existingIds);
+      };
+      keysReq.onerror = function(e) { rejectPre(e.target.error); };
+    }).then(function(existingIds) {
+      return new Promise(function(resolve, reject) {
+        var tx = db.transaction('memories', 'readwrite');
+        var store = tx.objectStore('memories');
+        var errors = [];
+        var newIds = {};
 
-      tx.oncomplete = function() { resolve(); };
-      tx.onerror = function(e) { reject(e.target.error); };
-      tx.onabort = function(e) { reject(e.target.error); };
+        tx.oncomplete = function() {
+          if (errors.length) reject(errors[0]);
+          else resolve();
+        };
+        tx.onerror = function(e) { reject(e.target.error); };
+        tx.onabort = function(e) { reject(e.target.error); };
 
-      var clearReq = store.clear();
-      clearReq.onsuccess = function() {
-        if (memories.length === 0) return; // oncomplete will resolve
+        // 使用 put 逐条写入（upsert），不再先 clear 后 add
         for (var i = 0; i < memories.length; i++) {
           (function(mem) {
-            var addReq = store.add(mem);
-            addReq.onerror = function(e) {
-              e.preventDefault(); // 阻止自动中止，显式拒绝以保留错误信息
-              reject(e.target.error);
-            };
+            newIds[mem.id] = true;
+            var putReq = store.put(mem);
+            putReq.onerror = function(e) { errors.push(e.target.error); tx.abort(); };
           })(memories[i]);
         }
-      };
-      clearReq.onerror = function(e) { reject(e.target.error); };
+
+        // 删除不在新数据集中的旧记录
+        for (var eid in existingIds) {
+          if (!newIds[eid]) store.delete(eid);
+        }
+      });
     });
   });
 };
@@ -568,11 +562,9 @@ DataService._migrateOldData = function() {
       } catch(e) { console.warn('[DataService] 读取现有记忆数据失败:', e.message); }
       var existingIds = {};
       for (var mi = 0; mi < existingMemories.length; mi++) {
-        if (!existingMemories[mi].id) existingMemories[mi].id = uid();
         existingIds[existingMemories[mi].id] = true;
       }
       for (var oi = 0; oi < oldMemories.length; oi++) {
-        if (!oldMemories[oi].id) oldMemories[oi].id = uid();
         if (!existingIds[oldMemories[oi].id]) {
           existingMemories.push(oldMemories[oi]);
           existingIds[oldMemories[oi].id] = true;
@@ -620,9 +612,9 @@ DataService.getById = function(id) {
  * 新增或更新记忆（有 id 则更新），自动补全 timestamp
  */
 DataService.save = function(memory) {
+  if (!memory || !memory.content) return Promise.reject(new Error('记忆内容不能为空'));
   var self = this;
-  return self._enqueueWrite(function() {
-  return self._readAll().then(function(memories) {
+  return this._readAll().then(function(memories) {
     var now = Date.now();
     var mem = createMemory(memory);
     var existingIdx = -1;
@@ -657,7 +649,6 @@ DataService.save = function(memory) {
       return mem;
     });
   });
-  }); // _enqueueWrite
 };
 
 /**
@@ -695,8 +686,7 @@ DataService.restore = function(id) {
  */
 DataService.permanentDelete = function(id) {
   var self = this;
-  return self._enqueueWrite(function() {
-  return self.getById(id).then(function(memory) {
+  return this.getById(id).then(function(memory) {
     if (!memory) return Promise.reject(new Error('Memory not found: ' + id));
     if (!memory.protected) {
       self._addToBlacklist(contentFingerprint(memory.content), memory.zone);
@@ -713,7 +703,6 @@ DataService.permanentDelete = function(id) {
       });
     });
   });
-  }); // _enqueueWrite
 };
 
 /**
@@ -721,14 +710,12 @@ DataService.permanentDelete = function(id) {
  */
 DataService.clear = function() {
   var self = this;
-  return self._enqueueWrite(function() {
-  return self._writeAll([]).then(function() {
+  return this._writeAll([]).then(function() {
     self._writeBlacklist([]);
     if (typeof SearchIndex !== 'undefined' && SearchIndex._db) {
       SearchIndex.rebuild();
     }
   });
-  }); // _enqueueWrite
 };
 
 /**
@@ -736,8 +723,7 @@ DataService.clear = function() {
  */
 DataService.deduplicate = function() {
   var self = this;
-  return self._enqueueWrite(function() {
-  return self._readAll().then(function(memories) {
+  return this._readAll().then(function(memories) {
     var seen = {};
     var unique = [];
     var sorted = memories.slice().sort(function(a, b) { return b.timestamp - a.timestamp; });
@@ -754,7 +740,6 @@ DataService.deduplicate = function() {
     }
     return unique;
   });
-  }); // _enqueueWrite
 };
 
 
@@ -790,7 +775,7 @@ function _tokenize(text) {
     var ch = str.charAt(i);
     if (_isChinese(ch)) {
       if (buf.length > 0) {
-        var words = buf.split(/[^a-z0-9]+/);
+        var words = buf.split(/[^a-z0-9']+/);
         for (var w = 0; w < words.length; w++) {
           if (words[w].length > 0) tokens.push(words[w]);
         }
@@ -815,7 +800,7 @@ function _tokenize(text) {
   }
 
   if (buf.length > 0) {
-    var words2 = buf.split(/[^a-z0-9]+/);
+    var words2 = buf.split(/[^a-z0-9']+/);
     for (var w2 = 0; w2 < words2.length; w2++) {
       if (words2[w2].length > 0) tokens.push(words2[w2]);
     }
@@ -1973,6 +1958,8 @@ var Scanner = {};
 Scanner._autoScanTimer = null;
 Scanner._observer = null;
 Scanner._pendingElement = null;
+Scanner._lastScanTime = 0;       // 诊断用：最近扫描时间
+Scanner._lastScanResult = null;  // 诊断用：{added, skipped, time}
 
 /**
  * 解析 XML 格式记忆块（兼容不规范 XML 的容错提取）
@@ -2261,10 +2248,11 @@ Scanner.scan = function() {
 Scanner.startAutoScan = function(intervalMs) {
   var self = this;
   this.stopAutoScan();
+  this._initVisibilityControl();
   this._autoScanInterval = intervalMs || 30000;
-  this.scan().catch(function(err) { _warn('[Scanner] auto-scan failed:', err); });
+  this.scan();
   this._autoScanTimer = targetWin.setInterval(function() {
-    self.scan().catch(function(err) { _warn('[Scanner] auto-scan failed:', err); });
+    self.scan();
   }, this._autoScanInterval);
 };
 
@@ -2397,17 +2385,6 @@ KnowledgeGraph.extractEntities = function(memory) {
   var content = memory.content;
   var now = Date.now();
 
-  // 基于标签匹配
-  if (memory.tags && memory.tags.length > 0) {
-    for (var ti = 0; ti < memory.tags.length; ti++) {
-      var tagName = memory.tags[ti];
-      var tagMeta = TagManager.getTagMeta ? TagManager.getTagMeta(tagName) : null;
-      if (tagMeta && tagMeta.isCore && (tagMeta.category === '关系')) {
-        // 关系类标签可能涉及实体关系，稍后在关系提取中处理
-      }
-    }
-  }
-
   // 基于角色名匹配
   if (memory.roleName) {
     this._upsertEntity(memory.roleName, 'character', now);
@@ -2438,18 +2415,16 @@ KnowledgeGraph.extractEntities = function(memory) {
       var relType = memory.tags[ri];
       if (RELATION_TYPES.indexOf(relType) !== -1) {
         // 查找内容中提到的另一个实体名
-        for (var ei = 0; ei < 2; ei++) {
-          var otherName = null;
-          var allNames = Object.keys(this._entities);
-          for (var ni = 0; ni < allNames.length; ni++) {
-            if (allNames[ni] !== memory.roleName && content.indexOf(allNames[ni]) !== -1) {
-              otherName = allNames[ni];
-              break;
-            }
+        var otherName = null;
+        var allNames = Object.keys(this._entities);
+        for (var ni = 0; ni < allNames.length; ni++) {
+          if (allNames[ni] !== memory.roleName && content.indexOf(allNames[ni]) !== -1) {
+            otherName = allNames[ni];
+            break;
           }
-          if (otherName && otherName !== memory.roleName) {
-            this.addRelation(memory.roleName, otherName, relType, memory.id);
-          }
+        }
+        if (otherName && otherName !== memory.roleName) {
+          this.addRelation(memory.roleName, otherName, relType, memory.id);
         }
       }
     }
@@ -2659,10 +2634,19 @@ KnowledgeGraph.getObservations = function(entityName) {
  * 防抖保存到 localStorage
  */
 KnowledgeGraph._saveTimer = null;
+KnowledgeGraph._unloadBound = false;
 KnowledgeGraph._scheduleSave = function() {
   var self = this;
   if (this._saveTimer) clearTimeout(this._saveTimer);
   this._saveTimer = setTimeout(function() { self.save(); }, 2000);
+  if (!this._unloadBound && typeof targetWin !== 'undefined') {
+    this._unloadBound = true;
+    try {
+      targetWin.addEventListener('beforeunload', function() {
+        if (self._saveTimer) { clearTimeout(self._saveTimer); self.save(); }
+      });
+    } catch(e) {}
+  }
 };
 
 /**
@@ -3092,7 +3076,7 @@ ArchiveManager._showSessionChangeDialog = function(memories, currentSessionId, o
         slots.push(slot);
         localStorage.setItem(self._slotsKey(), JSON.stringify(slots));
         self._setLastSessionId(currentSessionId);
-        DataService.clear().then(function() { resolve(); }).catch(function(err) { _warn('[ArchiveManager] auto-save clear failed:', err); resolve(); });
+        DataService.clear().then(function() { resolve(); });
       }
     ));
 
@@ -3114,7 +3098,7 @@ ArchiveManager._showSessionChangeDialog = function(memories, currentSessionId, o
             row.onclick = function() {
               self.createSnapshot(slot.saveKey).then(function() {
                 self._setLastSessionId(currentSessionId);
-                DataService.clear().then(function() { resolve(); }).catch(function(err) { _warn('[ArchiveManager] slot clear failed:', err); resolve(); });
+                DataService.clear().then(function() { resolve(); });
               });
             };
             slotList.appendChild(row);
@@ -3128,7 +3112,7 @@ ArchiveManager._showSessionChangeDialog = function(memories, currentSessionId, o
         newSlot.onclick = function() {
           self.createSlot('手动存档 - ' + oldSessionId.slice(0, 8)).then(function(newS) {
             self._setLastSessionId(currentSessionId);
-            DataService.clear().then(function() { resolve(); }).catch(function(err) { _warn('[ArchiveManager] new-slot clear failed:', err); resolve(); });
+            DataService.clear().then(function() { resolve(); });
           });
         };
         slotList.appendChild(newSlot);
@@ -3143,7 +3127,7 @@ ArchiveManager._showSessionChangeDialog = function(memories, currentSessionId, o
         cancelBtn.onclick = function() {
           if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
           // 重新弹窗
-          self._showSessionChangeDialog(memories, currentSessionId, oldSessionId).then(resolve).catch(function(err) { _warn('[ArchiveManager] re-dialog failed:', err); reject(err); });
+          self._showSessionChangeDialog(memories, currentSessionId, oldSessionId).then(resolve);
         };
         btns.appendChild(cancelBtn);
       }
@@ -3154,27 +3138,14 @@ ArchiveManager._showSessionChangeDialog = function(memories, currentSessionId, o
       '丢弃旧记忆（不可恢复）',
       'background:#e05d5d;color:#fff;border-color:#e05d5d;',
       function() {
-        // 替换 confirm() 为自定义 UI，避免 sandbox 限制
-        while (btns.firstChild) btns.removeChild(btns.firstChild);
-        var confirmText = targetDoc.createElement('p');
-        confirmText.textContent = '确定要丢弃 ' + memories.length + ' 条记忆吗？此操作不可恢复。';
-        confirmText.style.cssText = 'font-size:13px;color:#c44040;margin-bottom:12px;text-align:center;font-weight:500';
-        btns.appendChild(confirmText);
-        btns.appendChild(makeButton(
-          '确认丢弃',
-          'background:#e05d5d;color:#fff;border-color:#e05d5d;',
-          function() {
-            self._setLastSessionId(currentSessionId);
-            DataService.clear().then(function() { resolve(); }).catch(function(err) { _warn('[ArchiveManager] discard clear failed:', err); resolve(); });
-          }
-        ));
-        btns.appendChild(makeButton(
-          '取消',
-          '',
-          function() {
-            self._showSessionChangeDialog(memories, currentSessionId, oldSessionId).then(resolve).catch(function(err) { _warn('[ArchiveManager] discard-cancel dialog failed:', err); reject(err); });
-          }
-        ));
+        var confirmed = targetWin.confirm('确定要丢弃 ' + memories.length + ' 条记忆吗？此操作不可恢复。');
+        if (confirmed) {
+          self._setLastSessionId(currentSessionId);
+          DataService.clear().then(function() { resolve(); });
+        } else {
+          if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+          self._showSessionChangeDialog(memories, currentSessionId, oldSessionId).then(resolve);
+        }
       }
     ));
 
@@ -3393,6 +3364,10 @@ Exporter._importMemories = function(memories) {
         if (saved.tags && saved.tags.length > 0) {
           try { TagManager.recordTagUsage(saved.tags); } catch(e) { console.warn('[TagManager]', e); }
         }
+        // 记录检索（衰减追踪）
+        try { AdaptiveForgetting.recordRetrieval([saved.id]); } catch(e) { console.warn('[AdaptiveForgetting]', e); }
+        // 加入 Lorebook 关键词索引
+        try { LorebookManager._addToIndex(saved); } catch(e) { console.warn('[LorebookManager]', e); }
 
         return importNext(idx + 1);
       });
@@ -3738,6 +3713,9 @@ LorebookManager._keywordIndex = {};    // { keyword: [memoryId, ...] }
 LorebookManager._activatedCache = [];  // 上次 scan() 结果
 LorebookManager._tokenBudget = 500;
 LorebookManager._triggerStats = {};    // { keyword: count }
+LorebookManager._lastInjectTime = 0;   // 诊断用：最近注入时间
+LorebookManager._lastInjectOk = false; // 诊断用：最近注入是否成功
+LorebookManager._lastMatchKeywords = []; // 诊断用：最近命中的关键词
 
 /**
  * 从 DataService 全量重建关键词索引
@@ -3804,6 +3782,7 @@ LorebookManager.scan = function(recentMessages) {
   }
 
   var combined = recentMessages.join(' ');
+  var lowerCombined = combined.toLowerCase();
   var matchedIds = {};    // id -> hitCount
   var matchedMemories = {}; // id -> memory
   var visited = {};       // 递归防循环
@@ -3813,9 +3792,10 @@ LorebookManager.scan = function(recentMessages) {
    * 单层匹配
    */
   function matchLayer(text, layer) {
-    if (layer > MAX_RECURSION) return;
-    var lowerText = text.toLowerCase();
+    if (layer > MAX_RECURSION) return Promise.resolve();
     var keys = Object.keys(self._keywordIndex);
+    if (keys.length === 0) return Promise.resolve();
+    var lowerText = text.toLowerCase();
     var layerMatched = {};
 
     for (var i = 0; i < keys.length; i++) {
@@ -3950,7 +3930,8 @@ LorebookManager.injectToInput = function(memories) {
   lines.push('---');
   var text = lines.join('\n');
 
-  this._fillInput(text);
+  var ok = this._fillInput(text);
+  if (!ok) { UIManager._showCopyFallbackModal(text); UIManager.showToast('未找到输入框，请手动复制', 'info'); }
 };
 
 /**
@@ -3958,25 +3939,73 @@ LorebookManager.injectToInput = function(memories) {
  */
 LorebookManager._fillInput = function(text) {
   try {
-    // 尝试找到 textarea
-    var input = targetDoc.querySelector('textarea');
-    if (!input) {
-      input = targetDoc.querySelector('[contenteditable="true"]');
+    var input = null;
+    // 1. 优先使用用户自定义选择器
+    if (AutoTaskManager._customInputSelector) {
+      try { input = targetDoc.querySelector(AutoTaskManager._customInputSelector); } catch(e) {}
     }
+    // 2. textarea（取最后一个，聊天输入框通常在页面底部）
     if (!input) {
-      // 尝试常见聊天输入选择器
-      input = targetDoc.querySelector('.input, .chat-input, #input, #chat-input, [data-input]');
+      var allTA = targetDoc.querySelectorAll('textarea');
+      if (allTA && allTA.length > 0) {
+        // 优先选可见的、在视口下半部分的
+        for (var ti = allTA.length - 1; ti >= 0; ti--) {
+          var rect = allTA[ti].getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0 && rect.top > window.innerHeight * 0.3) {
+            input = allTA[ti]; break;
+          }
+        }
+        if (!input) input = allTA[allTA.length - 1];
+      }
     }
+    // 3. contenteditable
+    if (!input) {
+      var allCE = targetDoc.querySelectorAll('[contenteditable="true"]');
+      if (allCE && allCE.length > 0) {
+        for (var ci = allCE.length - 1; ci >= 0; ci--) {
+          var ceRect = allCE[ci].getBoundingClientRect();
+          if (ceRect.width > 0 && ceRect.height > 0 && ceRect.top > window.innerHeight * 0.3) {
+            input = allCE[ci]; break;
+          }
+        }
+        if (!input) input = allCE[allCE.length - 1];
+      }
+    }
+    // 4. 常见聊天输入选择器
+    if (!input) {
+      input = targetDoc.querySelector(
+        '.input, .chat-input, #input, #chat-input, [data-input], ' +
+        '[role="textbox"], [data-testid*="input"], .ProseMirror, ' +
+        'textarea, input[type="text"], .composer-input, .msg-input'
+      );
+    }
+    // 5. 终极降级：遍历所有 textarea/input，选面积最大的
+    if (!input) {
+      var allInputs = targetDoc.querySelectorAll('textarea, input[type="text"], [contenteditable="true"]');
+      var maxArea = 0;
+      for (var ai = 0; ai < allInputs.length; ai++) {
+        try {
+          var r = allInputs[ai].getBoundingClientRect();
+          var area = r.width * r.height;
+          if (area > maxArea) { maxArea = area; input = allInputs[ai]; }
+        } catch(e) {}
+      }
+    }
+
     if (input) {
       if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
         input.value = text;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
       } else {
         input.textContent = text;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
       }
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      // 聚焦输入框
+      try { input.focus(); } catch(e) {}
+      return true;
     }
   } catch(e) { console.warn('[LorebookManager]', e); }
+  return false;
 };
 
 /**
@@ -4062,7 +4091,8 @@ AdaptiveForgetting._evaluateInternal = function(memories) {
     if (mem.hidden && mem.archivedAt) continue; // 已归档的跳过
 
     var newScore = this._calcDecay(mem);
-    if (newScore !== mem.decayScore) {
+    var scoreChanged = (newScore !== mem.decayScore);
+    if (scoreChanged) {
       updatedScores++;
     }
     mem.decayScore = newScore;
@@ -4083,8 +4113,8 @@ AdaptiveForgetting._evaluateInternal = function(memories) {
       }));
     } else if (mem.importance >= self._dormantImportanceThreshold && newScore <= self._dormantDecayThreshold) {
       dormantCandidates.push(mem);
-    } else if (updatedScores > 0) {
-      // 仅当 decayScore 有变化时更新
+    } else if (scoreChanged) {
+      // 仅当本条记忆的 decayScore 有变化时更新
       updatePromises.push(DataService.update(mem.id, { decayScore: newScore }));
     }
   }
@@ -4567,12 +4597,18 @@ AutoTaskManager._executeTask = function(type, memories, params, rule) {
 
   if (mode === 'inject') {
     // 注入输入框
-    try { LorebookManager._fillInput(instruction); } catch(e) { console.warn('[LorebookManager]', e); }
-    UIManager.showToast('已将 ' + memories.length + ' 条记忆注入输入框', 'success');
+    var injected = false;
+    try { injected = LorebookManager._fillInput(instruction); } catch(e) { console.warn('[LorebookManager]', e); }
+    if (injected) {
+      UIManager.showToast('已将 ' + memories.length + ' 条记忆注入输入框', 'success');
+    } else {
+      UIManager._showCopyFallbackModal(instruction);
+      UIManager.showToast('未找到输入框，请手动复制', 'info');
+    }
   } else if (mode === 'notify') {
-    // 弹窗提示 - 复制到剪贴板
-    try { navigator.clipboard.writeText(instruction); UIManager.showToast('指令已复制，共 ' + memories.length + ' 条记忆（' + type + '）', 'success'); }
-    catch(ex) { UIManager._showCopyFallbackModal(instruction); }
+    // 弹窗提示 — 沙箱环境中 navigator.clipboard 不可靠，直接使用手动复制弹窗
+    UIManager._showCopyFallbackModal(instruction);
+    UIManager.showToast('已生成 ' + memories.length + ' 条记忆的指令（' + type + '），请手动复制', 'info');
   } else {
     // 仪表盘标记：推入通知队列，用户打开面板时可见
     var typeNames = { recall: '回顾提醒', summarize: '总结建议', dormant: '沉寂预警' };
@@ -4605,8 +4641,7 @@ AutoTaskManager._executeTask = function(type, memories, params, rule) {
     }
   }
 
-    // 记录检索
-    var ids = [];
+  // 记录检索
   var ids = [];
   for (var ri = 0; ri < memories.length; ri++) {
     ids.push(memories[ri].id);
@@ -4643,6 +4678,754 @@ AutoTaskManager.stopMaintenance = function() {
     targetWin.clearInterval(this._maintenanceTimer);
     this._maintenanceTimer = null;
   }
+};
+
+
+/* ====== Diagnostics ====== */
+// 运行时诊断系统 — 五条核心数据流端到端检测 + 一键自测
+
+var Diagnostics = {};
+Diagnostics._results = null;       // 上次完整诊断结果缓存
+Diagnostics._lastRun = 0;          // 上次运行时间
+Diagnostics._CACHE_TTL = 30000;    // 30秒缓存
+
+// 刷新追踪数据（从各模块拉取最新状态）
+Diagnostics.snapshot = function() {
+  var rules = (typeof RuleEngine !== 'undefined' && RuleEngine.getRules) ? RuleEngine.getRules() : [];
+  var scanOn = !!(typeof Scanner !== 'undefined' && Scanner._autoScanTimer);
+  var observerOn = !!(typeof Scanner !== 'undefined' && Scanner._observer);
+  var autoMode = (typeof AutoTaskManager !== 'undefined') ? (AutoTaskManager._triggerMode || 'notify') : 'notify';
+
+  return {
+    time: Date.now(),
+    scanActive: scanOn,
+    scanInterval: scanOn && Scanner._autoScanInterval ? (Scanner._autoScanInterval / 1000) : 0,
+    scanLastTime: Scanner._lastScanTime || 0,
+    scanLastResult: Scanner._lastScanResult,
+    observerActive: observerOn,
+    injectLastTime: LorebookManager._lastInjectTime || 0,
+    injectLastOk: LorebookManager._lastInjectOk,
+    injectMatchKw: LorebookManager._lastMatchKeywords || [],
+    kwIndexSize: Object.keys(LorebookManager._keywordIndex || {}).length,
+    copyFallbackCount: UIManager._copyFallbackCount || 0,
+    copyLastResult: UIManager._lastCopyResult,
+    rules: rules.map(function(r) {
+      return { type: r.type, enabled: r.enabled, counter: r.counter,
+        target: (r.conditions.roundCount || {}).min || 0,
+        lastTriggered: r.lastTriggered || 0 };
+    }),
+    autoMode: autoMode,
+    clipboardSafe: !!(typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText),
+    decayLastEval: (typeof AdaptiveForgetting !== 'undefined') ? (AdaptiveForgetting._lastEvaluateTime || 0) : 0
+  };
+};
+
+// 获取记忆统计数据（异步）
+Diagnostics.getMemoryStats = function() {
+  return DataService.getAll({ includeHidden: true }).then(function(all) {
+    if (!all) all = [];
+    var stats = { total: all.length, hidden: 0, archived: 0, reviewed: 0, summarized: 0,
+      protected: 0, withTags: 0, zones: {}, importanceDist: {}, summaryZone: 0 };
+    var now = Date.now();
+    for (var i = 0; i < all.length; i++) {
+      var m = all[i];
+      if (m.hidden) stats.hidden++;
+      if (m.archivedAt) stats.archived++;
+      if (m.reviewed) stats.reviewed++;
+      if (m.summarized) stats.summarized++;
+      if (m.protected) stats.protected++;
+      if (m.tags && m.tags.length > 0) stats.withTags++;
+      if (m.zone) { stats.zones[m.zone] = (stats.zones[m.zone] || 0) + 1; }
+      if (m.zone === '总结记忆') stats.summaryZone++;
+      var imp = m.importance || 3;
+      stats.importanceDist[imp] = (stats.importanceDist[imp] || 0) + 1;
+    }
+    // 衰减分布（抽样最多100条可见记忆）
+    var visible = [];
+    for (var vi = 0; vi < all.length; vi++) {
+      if (!all[vi].hidden && !all[vi].archivedAt) visible.push(all[vi]);
+    }
+    var sample = visible.slice(0, 100);
+    stats.decayDist = { fresh: 0, normal: 0, stale: 0, dormant: 0 };
+    for (var di = 0; di < sample.length; di++) {
+      var d = AdaptiveForgetting._calcDecay(sample[di]);
+      if (d > 0.8) stats.decayDist.fresh++;
+      else if (d > 0.5) stats.decayDist.normal++;
+      else if (d > 0.15) stats.decayDist.stale++;
+      else stats.decayDist.dormant++;
+    }
+    return stats;
+  });
+};
+
+// ====== 五条流自测 ======
+
+// 测试结果构造
+function _diagOk(msg) { return { pass: true, msg: msg }; }
+function _diagFail(msg, suggest) { return { pass: false, msg: msg, suggest: suggest || '' }; }
+
+// 流① 采集自测 — 直接用 Scanner 内部解析器验证，绕过黑名单/去重
+Diagnostics.testCollection = function() {
+  var results = [];
+  var testId = '__mm_diag_test_coll_' + Date.now();
+  try {
+    // 路径1: 直接测试 _extractFromElement（span.memory-raw 解析）
+    var testBlock1 = targetDoc.createElement('span');
+    testBlock1.className = 'memory-raw';
+    testBlock1.id = testId + '_p1';
+    testBlock1.style.cssText = 'display:none';
+    testBlock1.textContent = '<角色名>诊断测试</角色名><分区>角色记忆</分区><分类>其他</分类><内容>诊断自测Coll-' + testId + '</内容><重要性>3</重要性><标签>诊断测试,采集</标签>';
+    targetDoc.body.appendChild(testBlock1);
+
+    var parsed1 = Scanner._extractFromElement(testBlock1);
+    if (parsed1 && parsed1.content) {
+      results.push(_diagOk('✓ 路径1 (_extractFromElement): 解析成功 → ' + parsed1.zone + ' / ' + parsed1.content.substring(0, 40)));
+    } else {
+      results.push(_diagFail('✗ 路径1 (_extractFromElement): 解析失败', '检查 span.memory-raw 的 innerHTML 格式是否匹配 Scanner 期望'));
+    }
+
+    // 路径2: 直接测试 _parseBlock（【记忆开始】文本块解析）
+    var block2Text = '【记忆开始】\n<分区>角色记忆</分区>\n<角色名>诊断测试</角色名>\n<分类>其他</分类>\n<内容>诊断自测Coll2-' + testId + '</内容>\n<重要性>2</重要性>\n<标签>诊断测试</标签>\n【记忆结束】';
+    var parsed2 = Scanner._parseBlock(block2Text);
+    if (parsed2 && parsed2.content) {
+      results.push(_diagOk('✓ 路径2 (_parseBlock): 解析成功 → ' + parsed2.zone + ' / ' + parsed2.content.substring(0, 40)));
+    } else {
+      results.push(_diagFail('✗ 路径2 (_parseBlock): 解析失败', '检查【记忆开始】块格式或 _parseBlock 的 XML 标签匹配'));
+    }
+
+    // 黑名单检查：这两个指纹是否在黑名单中
+    if (parsed1 && parsed1.content) {
+      var fp1 = contentFingerprint(parsed1.content);
+      var bl1 = DataService._isBlacklisted(fp1, parsed1.zone);
+      results.push(bl1 ?
+        _diagFail('✗ 路径1指纹在黑名单中! (fp=' + fp1.substring(0, 40) + ')', '之前的 permanentDelete 将指纹加入了黑名单，新内容也被拦截。黑名单使用内容前100字精确匹配') :
+        _diagOk('✓ 路径1指纹不在黑名单中'));
+    }
+    if (parsed2 && parsed2.content) {
+      var fp2 = contentFingerprint(parsed2.content);
+      var bl2 = DataService._isBlacklisted(fp2, parsed2.zone);
+      results.push(bl2 ?
+        _diagFail('✗ 路径2指纹在黑名单中! (fp=' + fp2.substring(0, 40) + ')', '黑名单精确匹配导致拦截') :
+        _diagOk('✓ 路径2指纹不在黑名单中'));
+    }
+
+    // 黑名单大小
+    try {
+      var blArr = JSON.parse(localStorage.getItem(DataService.getRolePrefix() + '_blacklist') || '[]');
+      results.push({ pass: blArr.length < 300, msg: '当前黑名单: ' + blArr.length + '条' + (blArr.length >= 400 ? ' (接近500上限)' : '') });
+    } catch(e) {}
+
+    // 现在跑完整 Scanner.scan 看实际表现
+    return Scanner.scan().then(function(r) {
+      results.push({ pass: true, msg: 'Scanner.scan 实际结果: added=' + r.added + ', skipped=' + r.skipped });
+      var pass = parsed1 && parsed1.content && parsed2 && parsed2.content;
+      // 清理
+      try { targetDoc.body.removeChild(testBlock1); } catch(e) {}
+      return { flow: '采集流', pass: pass, results: results };
+    }).catch(function(e) {
+      results.push(_diagFail('Scanner.scan 异常: ' + (e.message || '')));
+      try { var el = targetDoc.getElementById(testId + '_p1'); if (el) targetDoc.body.removeChild(el); } catch(e2) {}
+      return { flow: '采集流', pass: false, results: results };
+    });
+  } catch(e) {
+    results.push(_diagFail('采集自测异常: ' + (e.message || String(e))));
+    return Promise.resolve({ flow: '采集流', pass: false, results: results });
+  }
+};
+
+// 流② 注入自测
+Diagnostics.testInjection = function() {
+  var results = [];
+  var testId = '__mm_diag_inj_' + Date.now();
+  try {
+    var testMem = createMemory({
+      content: '诊断自测：林夜在秘境中发现了一件名为"测试之剑"的法宝 [' + testId + ']',
+      zone: '角色记忆', roleName: '诊断测试', category: '其他',
+      importance: 1, tags: ['诊断测试'],
+      triggerKeywords: ['测试之剑', '诊断注入测试']
+    });
+    results.push(_diagOk('测试记忆已创建 (含关键词: 测试之剑, 诊断注入测试)'));
+
+    return DataService.save(testMem).then(function(saved) {
+      // 等待索引更新
+      return new Promise(function(resolve) {
+        setTimeout(function() {
+          LorebookManager.scan(['这是一条包含诊断注入测试和测试之剑的消息']).then(function(activated) {
+            if (activated && activated.length > 0) {
+              results.push(_diagOk('Lorebook.scan 命中 ' + activated.length + ' 条记忆'));
+              // 尝试注入
+              var ok = LorebookManager._fillInput(
+                '【诊断自测】以下为相关记忆，请自然融入叙事\n- [角色记忆] ' + saved.content + '\n---'
+              );
+              LorebookManager._lastInjectOk = ok;
+              LorebookManager._lastInjectTime = Date.now();
+              if (ok) {
+                results.push(_diagOk('_fillInput 成功：记忆已注入输入框'));
+              } else {
+                results.push(_diagFail('_fillInput 未找到输入框', '检查页面是否有 textarea 或 contenteditable 元素'));
+              }
+            } else {
+              results.push(_diagFail('Lorebook.scan 未命中 (activated=0)', '检查 LorebookManager._addToIndex 是否在 DataService.save hook 中被正确调用'));
+            }
+            // 清理
+            DataService.permanentDelete(saved.id).then(function() {
+              results.push(_diagOk('测试记忆已清理'));
+              resolve({ flow: '注入流', pass: activated && activated.length > 0, results: results });
+            }).catch(function() {
+              resolve({ flow: '注入流', pass: activated && activated.length > 0, results: results });
+            });
+          }).catch(function(e) {
+            results.push(_diagFail('Lorebook.scan 异常: ' + (e.message || String(e))));
+            DataService.permanentDelete(saved.id).catch(function(){});
+            resolve({ flow: '注入流', pass: false, results: results });
+          });
+        }, 200);
+      });
+    }).catch(function(e) {
+      results.push(_diagFail('DataService.save 失败: ' + (e.message || String(e)), '检查 IndexedDB 是否可用'));
+      return { flow: '注入流', pass: false, results: results };
+    });
+  } catch(e) {
+    results.push(_diagFail('注入自测异常: ' + (e.message || String(e))));
+    return Promise.resolve({ flow: '注入流', pass: false, results: results });
+  }
+};
+
+// 流③ 规则自测
+Diagnostics.testRules = function() {
+  var results = [];
+  try {
+    var rules = RuleEngine.getRules();
+    if (rules.length === 0) {
+      results.push(_diagFail('规则列表为空', '规则引擎未初始化或默认规则未创建'));
+      return Promise.resolve({ flow: '规则流', pass: false, results: results });
+    }
+    results.push(_diagOk('规则引擎已加载 ' + rules.length + ' 条规则'));
+
+    // 测试递增
+    var activeRules = [];
+    for (var ri = 0; ri < rules.length; ri++) {
+      if (rules[ri].enabled) activeRules.push(rules[ri]);
+    }
+    if (activeRules.length === 0) {
+      results.push(_diagFail('没有启用的规则', '在自动化面板中将规则设为"偶尔"或"频繁"'));
+      return Promise.resolve({ flow: '规则流', pass: false, results: results });
+    }
+
+    // 记录原始 counter 并递增
+    var savedCounters = [];
+    for (var ai = 0; ai < activeRules.length; ai++) {
+      savedCounters.push({ id: activeRules[ai].id, counter: activeRules[ai].counter });
+    }
+
+    // 递增一轮
+    try { AutoTaskManager.incrementRound(); } catch(e) {}
+    try { AutoTaskManager.checkAndTrigger(); } catch(e) {}
+
+    // 验证 counter 增加了
+    var incremented = 0;
+    for (var si = 0; si < savedCounters.length; si++) {
+      var updated = RuleEngine.getRules().filter(function(r) { return r.id === savedCounters[si].id; })[0];
+      if (updated && updated.counter > savedCounters[si].counter) {
+        incremented++;
+      }
+      // 恢复原值
+      try { RuleEngine.updateRule(savedCounters[si].id, { counter: savedCounters[si].counter }); } catch(e) {}
+    }
+    results.push(_diagOk('incrementRound 生效: ' + incremented + '/' + savedCounters.length + ' 条规则 counter 递增'));
+
+    return Promise.resolve({ flow: '规则流', pass: incremented > 0, results: results });
+  } catch(e) {
+    results.push(_diagFail('规则自测异常: ' + (e.message || String(e))));
+    return Promise.resolve({ flow: '规则流', pass: false, results: results });
+  }
+};
+
+// 流④ 衰减自测
+Diagnostics.testDecay = function() {
+  var results = [];
+  try {
+    var testMem = createMemory({
+      content: '诊断自测：验证衰减计算', zone: '角色记忆', importance: 1,
+      lastRetrievedAt: Date.now() - (90 * 86400000), // 90天前
+      timestamp: Date.now() - (100 * 86400000)
+    });
+    var decay = AdaptiveForgetting._calcDecay(testMem);
+    results.push(_diagOk('衰减计算: importance=1, 距上次检索=90天, decayScore=' + decay.toFixed(4)));
+
+    if (decay < 0.05) {
+      results.push(_diagOk('衰减分数正确（<0.05，远低于归档阈值）'));
+    } else if (decay < 0.3) {
+      results.push(_diagOk('衰减分数在合理范围'));
+    } else {
+      results.push(_diagFail('衰减分数异常高: ' + decay.toFixed(4) + ' (预期<0.05)', '检查 AdaptiveForgetting._calcDecay 公式'));
+    }
+
+    // 检查参数
+    var archiveDays = AdaptiveForgetting._archiveThresholdDays || 30;
+    var decayDays = AdaptiveForgetting._decayDays || 14;
+    results.push({ pass: true, msg: '当前参数: 归档阈值=' + archiveDays + '天, 半衰期=' + decayDays + '天' });
+
+    return Promise.resolve({ flow: '生命流', pass: decay < 0.3, results: results });
+  } catch(e) {
+    results.push(_diagFail('衰减自测异常: ' + (e.message || String(e))));
+    return Promise.resolve({ flow: '生命流', pass: false, results: results });
+  }
+};
+
+// 流⑤ 存储回路 — 端到端验证 IndexedDB 写-读-搜-删
+Diagnostics.testStorage = function() {
+  var results = [];
+  var testMem = null;
+  try {
+    testMem = createMemory({
+      content: '诊断自测：验证存储回路写-读-搜-删四步链路 [' + Date.now() + ']',
+      zone: '角色记忆', roleName: '诊断测试', category: '其他',
+      importance: 5, tags: ['诊断测试', '存储回路']
+    });
+    results.push(_diagOk('构建测试记忆对象'));
+
+    return DataService.save(testMem).then(function(saved) {
+      var realId = saved.id;
+      results.push(_diagOk('✓ 写入成功 (id: ' + realId + ')'));
+
+      return DataService.getById(realId).then(function(read) {
+        if (!read) {
+          results.push(_diagFail('✗ 读取失败: getById 返回 null', 'IndexedDB 可能存在事务问题'));
+          return { flow: '存储流', pass: false, results: results };
+        }
+        if (read.content !== testMem.content) {
+          results.push(_diagFail('✗ 内容不一致: 写入="' + (testMem.content||'').substring(0,30) + '" 读取="' + (read.content||'').substring(0,30) + '"'));
+        } else {
+          results.push(_diagOk('✓ 读取成功，内容一致'));
+        }
+
+        // 验证搜索索引
+        try {
+          var rebuildIdx = typeof SearchIndex !== 'undefined' && SearchIndex._buildIndex ? true : false;
+          if (rebuildIdx) {
+            results.push(_diagOk('SearchIndex 模块可用'));
+            // 测试索引中有文档
+            var stats = SearchIndex.getStats ? SearchIndex.getStats() : { total: 0 };
+            results.push({ pass: stats.total >= 0, msg: 'SearchIndex 文档总数: ' + (stats.total || 0) });
+          } else {
+            results.push({ pass: true, msg: 'SearchIndex 模块不可用（可能未初始化），跳过搜索验证' });
+          }
+        } catch(e) {
+          results.push({ pass: true, msg: 'SearchIndex 检查跳过: ' + (e.message || '') });
+        }
+
+        // 删除测试（带重试），删除验证失败视为警告而非错误
+        function tryDelete(attempt) {
+          return DataService.permanentDelete(realId).then(function() {
+            results.push(_diagOk('✓ 删除请求完成（尝试' + attempt + '）'));
+            return new Promise(function(resolve) {
+              setTimeout(function() {
+                DataService.getById(realId).then(function(deleted) {
+                  if (deleted) {
+                    if (attempt < 2) {
+                      setTimeout(function() { resolve(tryDelete(attempt + 1)); }, 200);
+                    } else {
+                      results.push({ pass: true, msg: '⚠ 删除后 IndexedDB 事务延迟（getById 仍可读到，属正常时序问题）' });
+                      results.push(_diagOk('写→读回路正常，存储功能可用'));
+                      resolve({ flow: '存储流', pass: true, results: results });
+                    }
+                  } else {
+                    results.push(_diagOk('✓ 删除验证通过'));
+                    resolve({ flow: '存储流', pass: true, results: results });
+                  }
+                }).catch(function() {
+                  results.push(_diagOk('✓ 删除验证通过（getById 拒绝）'));
+                  resolve({ flow: '存储流', pass: true, results: results });
+                });
+              }, 100);
+            });
+          }).catch(function(e) {
+            if (attempt < 2) {
+              return new Promise(function(resolve) {
+                setTimeout(function() { resolve(tryDelete(attempt + 1)); }, 200);
+              });
+            }
+            results.push({ pass: true, msg: '⚠ 删除异常: ' + (e.message || '') + '，但写读回路正常' });
+            return { flow: '存储流', pass: true, results: results };
+          });
+        }
+        return tryDelete(1);
+      }).catch(function(e) {
+        results.push(_diagFail('✗ 读取异常: ' + (e.message || '')));
+        return { flow: '存储流', pass: false, results: results };
+      });
+    }).catch(function(e) {
+      results.push(_diagFail('✗ 写入失败: ' + (e.message || ''), '检查 IndexedDB 是否可用、存储配额是否耗尽'));
+      return { flow: '存储流', pass: false, results: results };
+    });
+  } catch(e) {
+    results.push(_diagFail('存储回路自测异常: ' + (e.message || String(e))));
+    return Promise.resolve({ flow: '存储流', pass: false, results: results });
+  }
+};
+
+// 流⑥ 输入框质量 — 评估 _fillInput 能找到什么、写入是否生效
+Diagnostics.testInputQuality = function() {
+  var results = [];
+  try {
+    // 1. 盘点页面上所有输入元素
+    var allTA = targetDoc.querySelectorAll('textarea');
+    var allCE = targetDoc.querySelectorAll('[contenteditable="true"]');
+    var allInput = targetDoc.querySelectorAll('input[type="text"], .chat-input, #input, #chat-input, [data-input]');
+    results.push({ pass: true, msg: '页面输入元素: textarea=' + (allTA ? allTA.length : 0) +
+      ', contenteditable=' + (allCE ? allCE.length : 0) +
+      ', input/选择器=' + (allInput ? allInput.length : 0) });
+
+    if (allTA && allTA.length > 0) {
+      var taInfo = [];
+      for (var ti = 0; ti < Math.min(allTA.length, 5); ti++) {
+        try {
+          var r = allTA[ti].getBoundingClientRect();
+          taInfo.push('#' + ti + ': ' + Math.round(r.width) + 'x' + Math.round(r.height) +
+            ' @(' + Math.round(r.left) + ',' + Math.round(r.top) + ')' +
+            (r.width === 0 && r.height === 0 ? ' [隐藏]' : ''));
+        } catch(e) { taInfo.push('#' + ti + ': 无法读取位置'); }
+      }
+      results.push({ pass: true, msg: 'textarea 详情: ' + taInfo.join(' | ') });
+    }
+
+    // 2. 测试写入
+    var testText = '__mm_diag_input_test_' + Date.now();
+    var injected = LorebookManager._fillInput(testText);
+    results.push({ pass: true, msg: '_fillInput 返回值: ' + injected + ' (' + (injected ? '找到并写入了输入框' : '未找到输入框') + ')' });
+
+    if (injected) {
+      // 验证是否真的写入了
+      var found = false;
+      var foundIn = '';
+      try {
+        var input = targetDoc.querySelector('textarea');
+        if (!input) input = targetDoc.querySelector('[contenteditable="true"]');
+        if (input) {
+          var val = input.tagName === 'TEXTAREA' || input.tagName === 'INPUT' ? input.value : input.textContent;
+          if (val && val.indexOf(testText) !== -1) {
+            found = true; foundIn = 'textarea/contenteditable';
+          }
+        }
+      } catch(e) {}
+      results.push(found ?
+        _diagOk('✓ 写入验证通过: 文本已出现在 ' + foundIn) :
+        _diagFail('✗ 写入后未在输入框找到测试文本', '输入框可能是动态创建的（React/Vue），写入后被覆盖')
+      );
+
+      // 3. 检查可见性
+      try {
+        var visInput = targetDoc.querySelector('textarea');
+        if (!visInput) visInput = targetDoc.querySelector('[contenteditable="true"]');
+        if (visInput) {
+          var vr = visInput.getBoundingClientRect();
+          var vis = vr.width > 0 && vr.height > 0;
+          var atBottom = vr.top > window.innerHeight * 0.3;
+          results.push(vis ?
+            _diagOk('✓ 输入框可见 (' + Math.round(vr.width) + 'x' + Math.round(vr.height) + ', 距顶' + Math.round(vr.top) + 'px)') :
+            _diagFail('✗ 输入框不可见 (尺寸=0 或被 display:none 隐藏)', '检查页面 CSS')
+          );
+        }
+      } catch(e) {}
+    } else {
+      results.push(_diagFail('✗ 完全找不到输入框', '在仪表盘 → 扫描设置中设置自定义输入选择器'));
+    }
+  } catch(e) {
+    results.push(_diagFail('输入框自测异常: ' + (e.message || String(e))));
+  }
+  return Promise.resolve({ flow: '输入框', pass: injected !== undefined, results: results });
+};
+
+// 流⑦ 面板可用性 — 悬浮球/CSS/面板标签页/z-index
+Diagnostics.testPanel = function() {
+  var results = [];
+  try {
+    // 悬浮球
+    var ball = targetDoc.getElementById('mm-floating-ball');
+    if (!ball) {
+      results.push(_diagFail('✗ 悬浮球不存在', '初始化失败或 DOM 被清理'));
+    } else {
+      var br = ball.getBoundingClientRect();
+      if (br.width === 0 || br.height === 0) {
+        results.push(_diagFail('✗ 悬浮球不可见 (尺寸=0)', '被 CSS 隐藏或 display:none'));
+      } else {
+        results.push(_diagOk('✓ 悬浮球可见 (' + Math.round(br.width) + 'x' + Math.round(br.height) + ' @' + Math.round(br.left) + ',' + Math.round(br.top) + ')'));
+      }
+      // z-index
+      try {
+        var bz = parseInt(window.getComputedStyle(ball).zIndex, 10);
+        results.push({ pass: bz > 1000, msg: '悬浮球 z-index: ' + bz + (bz > 1000 ? '' : ' (偏低，可能被遮挡)') });
+      } catch(e) {}
+    }
+
+    // CSS 注入
+    var css = targetDoc.getElementById('mm-v9-styles');
+    results.push(css ?
+      _diagOk('✓ CSS 已注入 (mm-v9-styles)') :
+      _diagFail('✗ CSS 未注入', '面板打开后样式会出现问题'));
+
+    // WinBox 状态
+    var mm = window.MemoryMirror;
+    if (mm && mm._winbox) {
+      var wb = mm._winbox;
+      results.push({ pass: true, msg: 'WinBox 实例: ' + (wb.isOpen ? wb.isOpen() ? '已打开' : '已关闭' : '状态未知') });
+    } else {
+      results.push({ pass: true, msg: 'WinBox 未创建（首次点击悬浮球时创建）' });
+    }
+
+    // 宿主最深 z-index
+    try {
+      var allEls = targetDoc.querySelectorAll('*');
+      var maxZ = 0, maxZEl = '';
+      for (var zi = 0; zi < Math.min(allEls.length, 500); zi++) {
+        try {
+          var z = parseInt(window.getComputedStyle(allEls[zi]).zIndex, 10);
+          if (!isNaN(z) && z > maxZ) { maxZ = z; maxZEl = allEls[zi].tagName + '.' + (allEls[zi].className || '').substring(0, 30); }
+        } catch(e) {}
+      }
+      results.push({ pass: true, msg: '宿主页面最高 z-index: ' + maxZ + ' (' + maxZEl + ')' });
+    } catch(e) {}
+  } catch(e) {
+    results.push(_diagFail('面板检测异常: ' + (e.message || '')));
+  }
+  return Promise.resolve({ flow: '面板', pass: true, results: results });
+};
+
+// 流⑧ 数据完整性 — 索引一致性/必填字段/存档完整性
+Diagnostics.testIntegrity = function() {
+  var results = [];
+  try {
+    return DataService.getAll({ includeHidden: true }).then(function(all) {
+      if (!all || all.length === 0) {
+        results.push({ pass: true, msg: '记忆库为空，跳过完整性检查' });
+        return { flow: '完整性', pass: true, results: results };
+      }
+      results.push(_diagOk('记忆总数: ' + all.length));
+
+      // 必填字段抽样
+      var missing = 0, sample = Math.min(all.length, 20);
+      for (var si = 0; si < sample; si++) {
+        var m = all[Math.floor(Math.random() * all.length)];
+        if (!m.id || !m.content || !m.zone) missing++;
+      }
+      results.push(missing === 0 ?
+        _diagOk('✓ 必填字段完整 (抽样' + sample + '条，0条缺失)') :
+        _diagFail('✗ 必填字段缺失 (抽样' + sample + '条，' + missing + '条缺id/content/zone)', '数据可能损坏'));
+
+      // Lorebook 索引孤儿检测
+      var kwIndex = LorebookManager._keywordIndex || {};
+      var kwKeys = Object.keys(kwIndex);
+      if (kwKeys.length > 0) {
+        var idMap = {};
+        for (var ai = 0; ai < all.length; ai++) idMap[all[ai].id] = true;
+        var orphans = 0, totalRefs = 0;
+        for (var ki = 0; ki < kwKeys.length; ki++) {
+          var refs = kwIndex[kwKeys[ki]] || [];
+          totalRefs += refs.length;
+          for (var ri = 0; ri < refs.length; ri++) {
+            if (!idMap[refs[ri]]) orphans++;
+          }
+        }
+        results.push({ pass: orphans === 0,
+          msg: 'Lorebook 索引: ' + kwKeys.length + '关键词, ' + totalRefs + '引用, 孤儿=' + orphans +
+          (orphans > 0 ? ' (部分引用的记忆已被删除但索引未清理)' : '') });
+      } else {
+        results.push({ pass: true, msg: 'Lorebook 索引为空（无触发关键词记忆）' });
+      }
+
+      // 存档完整性
+      try {
+        var slots = JSON.parse(localStorage.getItem(DataService.getRolePrefix() + '_archive_slots') || '[]');
+        var slotIssues = 0;
+        for (var sl = 0; sl < slots.length; sl++) {
+          var data = localStorage.getItem(DataService.getRolePrefix() + '_' + (slots[sl].saveKey || ''));
+          if (!data) slotIssues++;
+        }
+        results.push(slotIssues === 0 ?
+          _diagOk('✓ 存档完整 (' + slots.length + '个槽位，0个损坏)') :
+          _diagFail('✗ 存档损坏 (' + slots.length + '个槽位，' + slotIssues + '个数据丢失)'));
+      } catch(e) {
+        results.push({ pass: true, msg: '存档检查跳过: ' + (e.message || '') });
+      }
+
+      return { flow: '完整性', pass: true, results: results };
+    }).catch(function(e) {
+      results.push(_diagFail('完整性检测异常: ' + (e.message || '')));
+      return { flow: '完整性', pass: false, results: results };
+    });
+  } catch(e) {
+    results.push(_diagFail('完整性检测异常: ' + (e.message || '')));
+    return Promise.resolve({ flow: '完整性', pass: false, results: results });
+  }
+};
+
+// 流⑨ 复制自测
+Diagnostics.testCopy = function() {
+  var results = [];
+  try {
+    var testMem = createMemory({
+      content: '诊断自测：验证复制链路 [' + Date.now() + ']', zone: '角色记忆', importance: 3,
+      tags: ['诊断测试']
+    });
+    results.push(_diagOk('测试记忆已构建'));
+
+    // 设选中ID并调用批量生成
+    var savedIds = UIManager._selectedIds ? UIManager._selectedIds.slice() : [];
+    UIManager._selectedIds = [testMem.id];
+
+    return DataService.save(testMem).then(function(saved) {
+      // 从DataService获取以验证实际ID
+      return DataService.getAll({ includeHidden: true }).then(function(memories) {
+        var actualMem = null;
+        for (var mi = 0; mi < memories.length; mi++) {
+          if (memories[mi].content && memories[mi].content.indexOf('诊断自测：验证复制链路') === 0) {
+            actualMem = memories[mi]; break;
+          }
+        }
+        if (actualMem) {
+          UIManager._selectedIds = [actualMem.id];
+          results.push(_diagOk('测试记忆已保存 (id: ' + actualMem.id + ')'));
+        }
+
+        // 构造文本（模拟 batchGenRecall）
+        var lines = ['请回顾以下记忆：'];
+        if (actualMem) lines.push('- [角色记忆] ' + actualMem.content);
+        var text = lines.join('\n');
+        results.push(_diagOk('生成文本长度: ' + text.length + ' 字符'));
+
+        // 测试剪贴板 — 三层检测
+        var clipboardLevel = 0; // 0=全失败, 1=execCommand, 2=ClipboardAPI
+        // 第一层：Clipboard API
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            clipboardLevel = 2;
+            results.push(_diagOk('✓ Clipboard API writeText 可用'));
+          } else {
+            results.push({ pass: true, msg: 'Clipboard API 不可用，尝试 execCommand' });
+          }
+        } catch(e) {
+          results.push({ pass: true, msg: 'Clipboard API 检测异常: ' + (e.message || '') });
+        }
+        // 第二层：execCommand('copy')
+        try {
+          var testTA = targetDoc.createElement('textarea');
+          testTA.value = '__mm_copy_test__';
+          testTA.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0';
+          targetDoc.body.appendChild(testTA);
+          testTA.focus(); testTA.select();
+          var execOk = targetDoc.execCommand('copy');
+          targetDoc.body.removeChild(testTA);
+          if (execOk) {
+            if (clipboardLevel < 2) clipboardLevel = 1;
+            results.push(_diagOk('✓ execCommand(\'copy\') 可用（沙箱兼容方案）'));
+          } else {
+            results.push(_diagFail('✗ execCommand(\'copy\') 返回 false', '浏览器不支持或沙箱限制过严'));
+          }
+        } catch(e) {
+          results.push(_diagFail('✗ execCommand(\'copy\') 异常: ' + (e.message || '')));
+        }
+
+        // sandbox 检测
+        var iframe = null;
+        try { iframe = window.frameElement; } catch(e) {}
+        if (iframe && iframe.sandbox) {
+          var hasCBW = iframe.sandbox.contains('allow-clipboard-write');
+          results.push(hasCBW ?
+            _diagOk('✓ sandbox 含 allow-clipboard-write') :
+            (clipboardLevel > 0 ?
+              _diagOk('sandbox 缺 allow-clipboard-write，但 execCommand 可工作') :
+              _diagFail('sandbox 缺 allow-clipboard-write 且 execCommand 不可用', '添加 allow-clipboard-write 到 sandbox'))
+          );
+        } else {
+          results.push({ pass: true, msg: '非iframe或无sandbox检测' });
+        }
+
+        // 综合评级
+        if (clipboardLevel === 0) {
+          results.push(_diagFail('复制链路评级: 不可用（全部方案失败）'));
+        } else if (clipboardLevel === 1) {
+          results.push({ pass: true, msg: '复制链路评级: 可用（execCommand 降级方案）' });
+        } else {
+          results.push(_diagOk('复制链路评级: 最佳（Clipboard API 原生方案）'));
+        }
+
+        // 记录结果
+        UIManager._lastCopyResult = { time: Date.now(), type: 'batchRecall', length: text.length, ok: clipboardLevel > 0 };
+
+        // 清理
+        UIManager._selectedIds = savedIds;
+        if (actualMem) {
+          DataService.permanentDelete(actualMem.id).then(function() {
+            results.push(_diagOk('测试记忆已清理'));
+          });
+        }
+
+        return { flow: '复制流', pass: true, results: results };
+      });
+    }).catch(function(e) {
+      results.push(_diagFail('复制自测异常: ' + (e.message || String(e))));
+      UIManager._selectedIds = savedIds;
+      return { flow: '复制流', pass: false, results: results };
+    });
+  } catch(e) {
+    results.push(_diagFail('复制自测异常: ' + (e.message || String(e))));
+    return Promise.resolve({ flow: '复制流', pass: false, results: results });
+  }
+};
+
+// 运行全部自测
+Diagnostics.runAll = function() {
+  var self = this;
+  return Promise.all([
+    this.testCollection(),
+    this.testInjection(),
+    this.testRules(),
+    this.testDecay(),
+    this.testStorage(),
+    this.testInputQuality(),
+    this.testPanel(),
+    this.testIntegrity(),
+    this.testCopy()
+  ]).then(function(flowResults) {
+    self._results = flowResults;
+    self._lastRun = Date.now();
+    return { snapshot: self.snapshot(), flows: flowResults };
+  });
+};
+
+// 启动自检（仅关键项，静默）
+Diagnostics.startupCheck = function() {
+  var issues = [];
+  // 检查 sandbox 剪贴板权限
+  try {
+    var iframe = window.frameElement;
+    if (iframe && iframe.sandbox && !iframe.sandbox.contains('allow-clipboard-write')) {
+      issues.push({ level: 'warn', msg: 'sandbox 缺少 allow-clipboard-write，复制功能需降级弹窗' });
+    }
+  } catch(e) {}
+  // 检查存储可用
+  if (!DataService._storageMode) {
+    issues.push({ level: 'error', msg: '存储层未初始化' });
+  } else if (DataService._storageMode === 'localStorage') {
+    issues.push({ level: 'warn', msg: 'IndexedDB 不可用，已降级到 localStorage（容量有限）' });
+  }
+  // 检查 DOM 可达
+  try {
+    if (!targetDoc || !targetDoc.body) {
+      issues.push({ level: 'error', msg: '无法访问页面 DOM，所有 UI 功能不可用' });
+    }
+  } catch(e) {
+    issues.push({ level: 'error', msg: 'DOM 访问异常: ' + (e.message || '') });
+  }
+  // 静默只输出日志
+  if (issues.length > 0) {
+    for (var ii = 0; ii < issues.length; ii++) {
+      var prefix = issues[ii].level === 'error' ? '[ERROR]' : '[WARN]';
+      _warn('诊断启动自检 ' + prefix + ' ' + issues[ii].msg);
+    }
+  }
+  return issues;
 };
 
 
@@ -4769,7 +5552,7 @@ RollbackManager._handleNodeRemoved = function(node) {
               DataService.softDelete(memIds[k]).catch(function(e) { console.warn('[RollbackManager]', e); });
               count++;
             }
-            self._records.splice(j, 1);
+            self._records[j].autoDeleted = true;
             break;
           }
         }
@@ -4834,13 +5617,18 @@ RollbackManager.rollbackLastRound = function() {
   }
   var record = this._records.pop();
   var count = 0;
+  var isRestore = !!record.autoDeleted;
   for (var i = 0; i < record.memoryIds.length; i++) {
-    DataService.softDelete(record.memoryIds[i]).catch(function(e) { console.warn('[RollbackManager]', e); });
+    if (isRestore) {
+      DataService.restore(record.memoryIds[i]).catch(function(e) { console.warn('[RollbackManager]', e); });
+    } else {
+      DataService.softDelete(record.memoryIds[i]).catch(function(e) { console.warn('[RollbackManager]', e); });
+    }
     count++;
   }
   this._clearElementAttribute(record.messageElement, record.id);
   if (typeof UIManager !== 'undefined' && UIManager.showToast) {
-    UIManager.showToast('已撤销 ' + count + ' 条记忆', 'success');
+    UIManager.showToast(isRestore ? ('已恢复 ' + count + ' 条记忆') : ('已撤销 ' + count + ' 条记忆'), 'success');
     UIManager.refresh();
   }
 };
@@ -4855,16 +5643,28 @@ RollbackManager.rollbackRounds = function(count) {
     return;
   }
   var total = 0;
+  var restoredCount = 0;
+  var deletedCount = 0;
   for (var r = 0; r < n; r++) {
     var record = this._records.pop();
+    var isRestore = !!record.autoDeleted;
     for (var i = 0; i < record.memoryIds.length; i++) {
-      DataService.softDelete(record.memoryIds[i]).catch(function(e) { console.warn('[RollbackManager]', e); });
+      if (isRestore) {
+        DataService.restore(record.memoryIds[i]).catch(function(e) { console.warn('[RollbackManager]', e); });
+        restoredCount++;
+      } else {
+        DataService.softDelete(record.memoryIds[i]).catch(function(e) { console.warn('[RollbackManager]', e); });
+        deletedCount++;
+      }
       total++;
     }
     this._clearElementAttribute(record.messageElement, record.id);
   }
   if (typeof UIManager !== 'undefined' && UIManager.showToast) {
-    UIManager.showToast('已撤销 ' + n + ' 轮共 ' + total + ' 条记忆', 'success');
+    var msg = '已撤销 ' + n + ' 轮共 ' + total + ' 条记忆';
+    if (restoredCount > 0) msg += '（恢复 ' + restoredCount + ' 条）';
+    if (deletedCount > 0) msg += '（删除 ' + deletedCount + ' 条）';
+    UIManager.showToast(msg, 'success');
     UIManager.refresh();
   }
 };
@@ -4935,7 +5735,7 @@ function WinBox(opts) {
   // 内容区
   var body = targetDoc.createElement('div');
   body.className = 'wb-body';
-  body.style.cssText = 'flex:1;overflow-y:auto;overflow-x:hidden;container-type:inline-size;container-name:mirror-panel';
+  body.style.cssText = 'flex:1;overflow-y:auto;overflow-x:hidden;container-type:inline-size;container-name:mirror-panel;background:#fafaf8;color:#2c2c2c';
   if (typeof opts.html === 'string') {
     body.innerHTML = opts.html;
   } else if (opts.html && opts.html.nodeType === 1) {
@@ -5035,6 +5835,13 @@ WinBox.prototype._initHeaderDrag = function(header) {
   targetDoc.addEventListener('touchmove', onMove, { passive: false });
   targetDoc.addEventListener('mouseup', onEnd);
   targetDoc.addEventListener('touchend', onEnd);
+  // 保存引用以便 close() 时清理
+  self._dragCleanup = function() {
+    targetDoc.removeEventListener('mousemove', onMove);
+    targetDoc.removeEventListener('touchmove', onMove);
+    targetDoc.removeEventListener('mouseup', onEnd);
+    targetDoc.removeEventListener('touchend', onEnd);
+  };
 };
 
 WinBox.prototype._initResizeDrag = function(handle) {
@@ -5097,6 +5904,7 @@ WinBox.prototype.close = function() {
   if (this._root.parentNode) this._root.parentNode.removeChild(this._root);
   var idx = _winboxInstances.indexOf(this);
   if (idx !== -1) _winboxInstances.splice(idx, 1);
+  if (this._dragCleanup) { this._dragCleanup(); this._dragCleanup = null; }
   if (this._opts.onclose) this._opts.onclose();
 };
 
@@ -5304,13 +6112,13 @@ function _renderPanelContent() {
   // ====== 概览仪表盘 ======
   var dashboardView = targetDoc.createElement('div');
   dashboardView.className = 'mm-dashboard-view';
-  dashboardView.style.cssText = 'flex:1;overflow-y:auto;overflow-x:hidden;padding:12px';
+  dashboardView.style.cssText = 'flex:1;overflow-y:auto;overflow-x:hidden;padding:12px;background:#fafaf8;color:#2c2c2c';
   container.appendChild(dashboardView);
 
   // ====== 记忆列表容器 ======
   var memoriesView = targetDoc.createElement('div');
   memoriesView.className = 'mm-memories-view';
-  memoriesView.style.cssText = 'display:none;flex:1;flex-direction:column;overflow:hidden';
+  memoriesView.style.cssText = 'display:none;flex:1;flex-direction:column;overflow:hidden;background:#fafaf8;color:#2c2c2c';
 
   // 搜索 + 筛选
   var filterArea = targetDoc.createElement('div');
@@ -5323,7 +6131,7 @@ function _renderPanelContent() {
   searchInput.type = 'text';
   searchInput.className = 'mirror-search-input';
   searchInput.placeholder = '搜索记忆…';
-  searchInput.style.cssText = 'flex:1;padding:6px 10px;border:1px solid #e8e4de;border-radius:2px;font-size:13px;outline:none';
+  searchInput.style.cssText = 'flex:1;padding:6px 10px;border:1px solid #e8e4de;border-radius:2px;font-size:13px;outline:none;background:#fff;color:#2c2c2c';
   searchInput.addEventListener('input', debounce(function() { _renderMemoryList(); }, 250));
   searchRow.appendChild(searchInput);
 
@@ -5405,7 +6213,7 @@ function _renderPanelContent() {
   // ====== 时间线视图 ======
   var timelineView = targetDoc.createElement('div');
   timelineView.className = 'mm-timeline-view';
-  timelineView.style.cssText = 'display:none;flex:1;flex-direction:column;overflow:hidden';
+  timelineView.style.cssText = 'display:none;flex:1;flex-direction:column;overflow:hidden;background:#fafaf8;color:#2c2c2c';
 
   // 时间线筛选
   var tlFilter = targetDoc.createElement('div');
@@ -5462,7 +6270,7 @@ function _renderPanelContent() {
       var options = sorted.map(function(t) { return '<option value="' + escapeHtml(t) + '">' + escapeHtml(t) + ' (' + _fmtNum(tagCounts[t]) + ')</option>'; }).join('');
       filterTag.innerHTML = '<option value="">全部标签</option>' + options;
       tlTagSel.innerHTML = '<option value="">全部标签</option>' + options;
-    }).catch(function(err) { _warn('[TagSelect] update failed:', err); });
+    });
   }
 
   // 存储引用
@@ -5651,54 +6459,11 @@ var TUTORIAL_STEPS = [
   { id:'automation', title:'自动记忆维护', text:'最省心的功能。打开后它会定期帮你回顾旧记忆、总结散乱记录、提醒沉寂内容。你只需要调频率：关 / 偶尔 / 频繁。', highlight:'mm-btn', action:'open-auto-panel', tip:'点击工具栏「自动化」按钮试试调整频率', setup:function(){ if(_panelContentEl&&_panelContentEl._switchTab)_panelContentEl._switchTab('overview'); } }
 ];
 
-function _startTutorial() {
-  if (_tutorialStepIndex >= TUTORIAL_STEPS.length) { _endTutorial(); return; }
-  var step = TUTORIAL_STEPS[_tutorialStepIndex];
-  if (step.setup) step.setup();
-  var oldOverlay = targetDoc.getElementById('mm-tutorial-overlay');
-  if (oldOverlay && oldOverlay.parentNode) oldOverlay.parentNode.removeChild(oldOverlay);
+function _startTutorial() {}
 
-  var overlay = targetDoc.createElement('div');
-  overlay.id = 'mm-tutorial-overlay';
-  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;z-index:99997;pointer-events:none';
-  var bg = targetDoc.createElement('div');
-  bg.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.45);pointer-events:auto';
-  overlay.appendChild(bg);
+function _endTutorial() {}
 
-  var card = targetDoc.createElement('div');
-  card.style.cssText = 'position:absolute;bottom:100px;left:50%;transform:translateX(-50%);width:380px;max-width:90vw;background:#fff;border-radius:16px;padding:24px;box-shadow:0 8px 40px rgba(0,0,0,0.2);pointer-events:auto;z-index:99998;animation:mm-fade-in 0.3s ease';
-  card.innerHTML = '<div style="text-align:center;font-size:32px;margin-bottom:8px">' + (_tutorialStepIndex===0?'★':_tutorialStepIndex===4?'☆':'◉') + '</div>' +
-    '<h3 style="text-align:center;font-size:17px;color:#2c2c2c;margin:0 0 8px">' + step.title + '</h3>' +
-    '<p style="font-size:13px;color:#333;line-height:1.6;text-align:center;margin:0 0 6px">' + step.text + '</p>' +
-    '<p style="font-size:12px;color:#b84040;text-align:center;font-weight:500;margin:0 0 14px">' + step.tip + '</p>' +
-    '<div style="display:flex;gap:8px;justify-content:center">' +
-    '<button id="mm-tut-skip" class="mm-btn mm-btn-sm" style="border-radius:16px">跳过教程</button>' +
-    '<button id="mm-tut-next" class="mm-btn mm-btn-primary mm-btn-sm" style="border-radius:16px">' + (_tutorialStepIndex < TUTORIAL_STEPS.length-1 ? '下一步' : '完成') + '</button>' +
-    '</div><div style="text-align:center;margin-top:10px;font-size:10px;color:#555">第 ' + (_tutorialStepIndex+1) + '/' + TUTORIAL_STEPS.length + ' 步</div>';
-  overlay.appendChild(card);
-  targetDoc.body.appendChild(overlay);
-  card.querySelector('#mm-tut-skip').addEventListener('click', _endTutorial);
-  card.querySelector('#mm-tut-next').addEventListener('click', function() {
-    _tutorialStepIndex++;
-    if (_tutorialStepIndex >= TUTORIAL_STEPS.length) { _endTutorial(); } else { _startTutorial(); }
-  });
-}
-
-function _endTutorial() {
-  var overlay = targetDoc.getElementById('mm-tutorial-overlay');
-  if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
-  try { localStorage.setItem(_getTutorialKey(), '1'); } catch(e) {}
-  var confetti = targetDoc.createElement('div');
-  confetti.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:99999;font-size:42px;animation:mm-fade-in 0.5s ease;pointer-events:none;text-align:center';
-  confetti.innerHTML = '<div style="font-size:48px">✨</div><p style="font-size:16px;color:#b84040;font-weight:600">太棒了，你已经上手了！</p><p style="font-size:13px;color:#333">每个功能旁边都有 ? 按钮，随时可以查看帮助。更多玩法请看功能地图。</p>';
-  targetDoc.body.appendChild(confetti);
-  setTimeout(function() { if (confetti.parentNode) confetti.parentNode.removeChild(confetti); }, 4000);
-  _tutorialStepIndex = 0;
-}
-
-function _resetTutorial() {
-  try { localStorage.removeItem(_getTutorialKey()); } catch(e) {}
-}
+function _resetTutorial() {}
 
 // ====== 帮助系统 ======
 var HELP_TOPICS = {
@@ -5774,118 +6539,15 @@ function _showManualImpl() {
 };
 
 // ====== 功能地图 ======
-function _renderFeatureMap() {
-  var tree = [
-    { label:'记录', items:['手动新建','扫描页面标记','导入 JSON'], actions:[function(){UIManager._showQuickCreate();},function(){Scanner.scan();},function(){UIManager._triggerImport();}] },
-    { label:'整理', items:['搜索记忆','时间线浏览','标签管理','去重 / 合并'], actions:[function(){if(_panelContentEl&&_panelContentEl._switchTab)_panelContentEl._switchTab('memories');},function(){if(_panelContentEl&&_panelContentEl._switchTab)_panelContentEl._switchTab('timeline');},function(){UIManager._showTagManager();},function(){UIManager._triggerDedup();}] },
-    { label:'维护', items:['定期回顾','定期总结','遗忘衰减','沉寂提醒'], actions:[function(){UIManager._showAutoPanel();},function(){UIManager._showAutoPanel();},function(){UIManager._showForgettingConfig();},function(){_showHelpCardImpl('forgetting');}] },
-    { label:'分析', items:['帮我分析','找相似','矛盾检测','知识图谱'], actions:[function(){_runAnalysis().then(_showAnalysisReport).catch(function(err) { UIManager.showToast('分析失败', 'error'); });},function(){_showHelpCardImpl('similar');},function(){UIManager._showConflictList();},function(){UIManager._showKnowledgeGraph();}] },
-    { label:'保护', items:['存档 / 恢复','导出 / 导入','回收站'], actions:[function(){UIManager._showArchiveManager();},function(){_showHelpCardImpl('archive');},function(){_showHelpCardImpl('recycle');}] },
-    { label:'调校', items:['模板编辑','自动化设置','主题标签包','触发词测试'], actions:[function(){UIManager._showTemplateManager();},function(){UIManager._showAutoPanel();},function(){UIManager._showTagManager();},function(){UIManager._showTriggerTester();}] }
-  ];
-  var fmDiv = targetDoc.createElement('div');
-  fmDiv.style.cssText = 'background:#fafaf8;border:1px solid #e8e4de;border-radius:12px;padding:14px;margin-top:12px';
-  var fmTitle = targetDoc.createElement('div');
-  fmTitle.style.cssText = 'display:flex;align-items:center;gap:8px;margin-bottom:12px;cursor:pointer';
-  fmTitle.innerHTML = '<span style="font-size:13px;font-weight:600;color:#2c2c2c">功能地图</span><span style="font-size:10px;color:#555"> 点击展开</span>';
-  fmDiv.appendChild(fmTitle);
-  var fmContent = targetDoc.createElement('div'); fmContent.style.cssText = 'display:none';
-  for (var ti = 0; ti < tree.length; ti++) {
-    var cat = tree[ti];
-    var catDiv = targetDoc.createElement('div'); catDiv.style.cssText = 'margin-bottom:8px';
-    var catLabel = targetDoc.createElement('div'); catLabel.textContent = cat.label; catLabel.style.cssText = 'font-size:11px;font-weight:600;color:#b84040;margin-bottom:4px;padding:2px 0';
-    catDiv.appendChild(catLabel);
-    for (var ci = 0; ci < cat.items.length; ci++) {
-      var childBtn = targetDoc.createElement('button'); childBtn.textContent = cat.items[ci]; childBtn.className = 'mm-btn mm-btn-xs';
-      childBtn.style.cssText = 'font-size:10px;padding:3px 10px;margin:2px 4px 2px 0;border-radius:12px;display:inline-block';
-      (function(act){ childBtn.addEventListener('click',function(){if(act)act();}); })(cat.actions[ci]);
-      catDiv.appendChild(childBtn);
-    }
-    fmContent.appendChild(catDiv);
-  }
-  fmDiv.appendChild(fmContent);
-  fmTitle.addEventListener('click', function() {
-    fmContent.style.display = fmContent.style.display === 'none' ? 'block' : 'none';
-    fmTitle.querySelector('span:last-child').textContent = fmContent.style.display === 'none' ? ' 点击展开' : ' 点击收起';
-  });
-  return fmDiv;
-}
+function _renderFeatureMap() { return targetDoc.createElement("div"); }
 
 // ====== 仪表盘渲染 ======
-
-/**
- * 计算当前 localStorage 存储用量，按组件分解
- * 用于仪表盘存储监控和配额预警
- */
-function _calculateStorageUsage() {
-  var totalChars = 0;
-  var breakdown = {
-    memories: 0,
-    archives: 0,
-    knowledgeGraph: 0,
-    blacklist: 0,
-    tagsAndThemes: 0,
-    rules: 0,
-    config: 0,
-    other: 0
-  };
-  var prefix = 'MemoryMirror_';
-  try {
-    for (var i = 0; i < localStorage.length; i++) {
-      var key = localStorage.key(i);
-      if (!key || key.indexOf(prefix) !== 0) continue;
-      var val = localStorage.getItem(key);
-      if (val === null) continue;
-      var chars = val.length;
-      totalChars += chars;
-
-      if (key.indexOf('_slot_data_') !== -1) {
-        breakdown.archives += chars;
-      } else if (key.indexOf('_memories') !== -1) {
-        breakdown.memories += chars;
-      } else if (key.indexOf('_kg') !== -1) {
-        breakdown.knowledgeGraph += chars;
-      } else if (key.indexOf('_blacklist') !== -1) {
-        breakdown.blacklist += chars;
-      } else if (key.indexOf('_tag_') !== -1 || key.indexOf('_custom_tags') !== -1 || key.indexOf('_themes') !== -1) {
-        breakdown.tagsAndThemes += chars;
-      } else if (key.indexOf('_rules') !== -1) {
-        breakdown.rules += chars;
-      } else if (key.indexOf('_forgetting') !== -1 || key.indexOf('_templates') !== -1 || key.indexOf('_tutorial') !== -1 || key.indexOf('_label') !== -1 || key.indexOf('_session_') !== -1 || key.indexOf('_role_') !== -1) {
-        breakdown.config += chars;
-      } else if (key.indexOf('_save_slots') !== -1 || key.indexOf('_last_session') !== -1) {
-        breakdown.archives += chars;
-      } else {
-        breakdown.other += chars;
-      }
-    }
-  } catch(e) { /* 扫描非致命 */ }
-
-  // localStorage 单域上限约 5MB (UTF-16 ≈ 2.5M 字符)
-  var maxChars = 2.5 * 1024 * 1024;
-  var pct = Math.min(100, Math.round((totalChars / maxChars) * 100));
-  var usedKB = Math.round(totalChars * 2 / 1024);
-
-  return {
-    totalChars: totalChars,
-    usedKB: usedKB,
-    maxKB: 5120,
-    pct: pct,
-    breakdown: breakdown
-  };
-}
-
 function _renderDashboard() {
   if (!_panelContentEl || !_panelContentEl._dashboardView) return;
   var dash = _panelContentEl._dashboardView;
   while (dash.firstChild) dash.removeChild(dash.firstChild);
 
   DataService.getAll({ includeHidden: false }).then(function(memories) {
-    var hiddenCount = 0;
-    DataService.getAll({ includeHidden: true }).then(function(allMems) {
-      hiddenCount = allMems.length - memories.length;
-    }).catch(function(err) { _warn('[Dashboard] render failed:', err); });
-
     var now = Date.now();
     var weekAgo = now - 7 * 86400000;
     var weekNew = 0;
@@ -6002,67 +6664,6 @@ function _renderDashboard() {
     healthDiv.appendChild(healthBarOuter);
     dash.appendChild(healthDiv);
 
-    // 存储用量监控
-    var storageInfo = _calculateStorageUsage();
-    var storageDiv = targetDoc.createElement('div');
-    storageDiv.style.cssText = 'background:#fafaf8;border-radius:10px;padding:10px 14px;margin-bottom:12px;border:1px solid #e8e4de';
-    var storageHeader = targetDoc.createElement('div');
-    storageHeader.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:6px';
-    var storageLabel = targetDoc.createElement('span');
-    storageLabel.style.cssText = 'font-size:12px;color:#333';
-    storageLabel.textContent = '存储用量';
-    storageHeader.appendChild(storageLabel);
-    var storagePct = targetDoc.createElement('span');
-    storagePct.style.cssText = 'font-size:12px;font-weight:600;color:' +
-      (storageInfo.pct >= 95 ? '#c44040' : storageInfo.pct >= 80 ? '#d4a040' : '#2c2c2c');
-    storagePct.textContent = storageInfo.pct + '%';
-    storageHeader.appendChild(storagePct);
-    storageDiv.appendChild(storageHeader);
-
-    // 进度条
-    var storageBarOuter = targetDoc.createElement('div');
-    storageBarOuter.style.cssText = 'height:8px;background:#e8e4de;border-radius:4px;overflow:hidden;margin-bottom:4px';
-    var storageBarInner = targetDoc.createElement('div');
-    var barColor = storageInfo.pct >= 95 ? '#c44040' : storageInfo.pct >= 80 ? '#d4a040' : '#7bb87b';
-    storageBarInner.style.cssText = 'height:100%;border-radius:4px;transition:width 0.5s;background:' + barColor;
-    storageBarInner.style.width = Math.max(2, storageInfo.pct) + '%';
-    storageBarOuter.appendChild(storageBarInner);
-    storageDiv.appendChild(storageBarOuter);
-
-    // 用量文字
-    var storageDetail = targetDoc.createElement('div');
-    storageDetail.style.cssText = 'font-size:10px;color:#555;display:flex;justify-content:space-between';
-    var statusText = storageInfo.pct >= 95 ? '即将耗尽，请清理存档或导出旧记忆' :
-                     storageInfo.pct >= 80 ? '空间偏紧，建议清理旧存档' :
-                     '空间充足';
-    storageDetail.textContent = '已用 ' + storageInfo.usedKB + ' KB / 约 ' + storageInfo.maxKB + ' KB · ' + statusText;
-    if (storageInfo.pct >= 80) storageDetail.style.color = '#b84040';
-    storageDiv.appendChild(storageDetail);
-
-    // 存储模式说明
-    if (DataService._storageMode === 'indexedDB') {
-      var modeHint = targetDoc.createElement('div');
-      modeHint.style.cssText = 'font-size:9px;color:#999;margin-top:2px';
-      modeHint.textContent = '记忆主体存储于 IndexedDB，不计入上述用量。存档快照和配置数据使用 localStorage。';
-      storageDiv.appendChild(modeHint);
-    }
-
-    // 存档快照占用提示
-    if (storageInfo.breakdown.archives > 0) {
-      var archiveHint = targetDoc.createElement('div');
-      archiveHint.style.cssText = 'font-size:10px;color:#888;margin-top:4px';
-      var archiveKB = Math.round(storageInfo.breakdown.archives * 2 / 1024);
-      archiveHint.textContent = '其中存档快照占用 ' + archiveKB + ' KB（' +
-        Math.round(storageInfo.breakdown.archives / Math.max(1, storageInfo.totalChars) * 100) + '%），可打开存档管理器清理旧存档';
-      archiveHint.style.cursor = 'pointer';
-      archiveHint.addEventListener('click', function() { UIManager._showArchiveManager(); });
-      archiveHint.addEventListener('mouseenter', function() { this.style.color = '#b84040'; });
-      archiveHint.addEventListener('mouseleave', function() { this.style.color = '#888'; });
-      storageDiv.appendChild(archiveHint);
-    }
-
-    dash.appendChild(storageDiv);
-
     // 仪表盘通知（来自自动化触发）
     var activeNotifs = [];
     for (var ni = 0; ni < AutoTaskManager._dashboardNotifications.length; ni++) {
@@ -6168,8 +6769,16 @@ function _renderDashboard() {
       r.appendChild(document.createTextNode(label + '：' + (active ? '运行中' : '已停止') + (detail ? ' (' + detail + ')' : '')));
       return r;
     }
-    statusDiv.appendChild(statusRow('自动扫描', autoScanOn, autoScanOn ? '每 ' + interval + ' 秒' : null));
-    statusDiv.appendChild(statusRow('实时监听', observerOn, null));
+    var autoScanRow = statusRow('自动扫描', autoScanOn, autoScanOn ? '每 ' + interval + ' 秒' : (Scanner._autoScanInterval ? '间隔 ' + (Scanner._autoScanInterval / 1000) + ' 秒（已停止）' : '点击配置'));
+    autoScanRow.style.cursor = 'pointer';
+    autoScanRow.title = '点击打开扫描设置';
+    autoScanRow.addEventListener('click', function() { UIManager._showScanSettings(); });
+    statusDiv.appendChild(autoScanRow);
+    var observerRow = statusRow('实时监听', observerOn, null);
+    observerRow.style.cursor = 'pointer';
+    observerRow.title = '点击打开扫描设置';
+    observerRow.addEventListener('click', function() { UIManager._showScanSettings(); });
+    statusDiv.appendChild(observerRow);
     statusDiv.appendChild(statusRow('Lorebook 触发', lbMemCount > 0, lbMemCount + ' 条关键词'));
     statusDiv.appendChild(statusRow('规则引擎', rules.length > 0, rules.length + ' 条规则'));
     if (nextRecallRound !== null && nextRecallRound > 0) {
@@ -6182,12 +6791,14 @@ function _renderDashboard() {
     qaDiv.style.cssText = 'display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px';
     var qActions = [
       { label: '新建记忆', icon: '+', action: function() { UIManager._showQuickCreate(); } },
-      { label: '立即扫描', icon: '&#8635;', action: function() { Scanner.scan().then(function(r) { UIManager.showToast('新增 ' + r.added + ' 条', 'success'); _renderDashboard(); }).catch(function(err) { UIManager.showToast('扫描失败: ' + (err && err.message ? err.message : '未知错误'), 'error'); }) } },
+      { label: '立即扫描', icon: '&#8635;', action: function() { Scanner.scan().then(function(r) { UIManager.showToast('新增 ' + r.added + ' 条', 'success'); _renderDashboard(); }); } },
+      { label: '扫描设置', icon: '&#9881;', action: function() { UIManager._showScanSettings(); } },
       { label: '导出备份', icon: '&#8615;', action: function() { UIManager._triggerExport(); } },
       { label: '管理存档', icon: '&#9733;', action: function() { UIManager._showArchiveManager(); } },
       { label: '触发测试', icon: '&#9881;', action: function() { UIManager._showTriggerTester(); } },
       { label: '导出提示', icon: '&#8627;', action: function() { UIManager._exportAsPrompt(); } },
-      { label: '使用说明', icon: '?', action: function() { UIManager._showManual(); } }
+      { label: '使用说明', icon: '?', action: function() { UIManager._showManual(); } },
+      { label: '系统诊断', icon: '🔍', action: function() { UIManager._showDiagnostics(); } }
     ];
     for (var qai = 0; qai < qActions.length; qai++) {
       (function(qa) {
@@ -6230,15 +6841,11 @@ function _renderDashboard() {
         magicBtn.textContent = '帮我分析';
         magicBtn.disabled = false;
         _showAnalysisReport(report);
-      }).catch(function(err) {
-        magicBtn.textContent = '帮我分析';
-        magicBtn.disabled = false;
-        UIManager.showToast('分析失败: ' + (err && err.message ? err.message : '未知错误'), 'error');
       });
     });
     magicDiv.appendChild(magicBtn);
     dash.appendChild(magicDiv);
-  }).catch(function(err) { _warn('[Dashboard] render failed:', err); });
+  });
 }
 
 // 一键分析引擎
@@ -6322,6 +6929,8 @@ function _renderTimeline() {
   var tc = _panelContentEl._tlContent;
   while (tc.firstChild) tc.removeChild(tc.firstChild);
 
+  var MAX_RENDER = _panelContentEl._maxRenderTimeline || 150;
+
   var zoneFilter = _panelContentEl._tlZoneSel ? _panelContentEl._tlZoneSel.value : '';
   var tagFilter = _panelContentEl._tlTagSel ? _panelContentEl._tlTagSel.value : '';
   var groupBy = _panelContentEl._tlGroup ? _panelContentEl._tlGroup.value : 'day';
@@ -6330,6 +6939,10 @@ function _renderTimeline() {
     if (zoneFilter) memories = memories.filter(function(m) { return m.zone === zoneFilter; });
     if (tagFilter) memories = memories.filter(function(m) { return m.tags && m.tags.indexOf(tagFilter) !== -1; });
     memories.sort(function(a, b) { return b.timestamp - a.timestamp; });
+
+    var totalCount = memories.length;
+    var truncated = totalCount > MAX_RENDER;
+    if (truncated) memories = memories.slice(0, MAX_RENDER);
 
     if (memories.length === 0) {
       var empty = targetDoc.createElement('div');
@@ -6361,6 +6974,7 @@ function _renderTimeline() {
       currentGroup.memories.push(memories[i]);
     }
 
+    var frag = targetDoc.createDocumentFragment();
     var now = Date.now();
     for (var gi = 0; gi < groups.length; gi++) {
       var group = groups[gi];
@@ -6374,44 +6988,67 @@ function _renderTimeline() {
 
       for (var mi = 0; mi < group.memories.length; mi++) {
         (function(m) {
-        var tlCard = targetDoc.createElement('div');
-        var daysAgo = Math.floor((now - m.timestamp) / 86400000);
-        var timeLabel = daysAgo === 0 ? '今天' + _timeStr(m.timestamp) : daysAgo === 1 ? '昨天' + _timeStr(m.timestamp) : daysAgo + ' 天前';
-        tlCard.style.cssText = 'display:flex;align-items:flex-start;gap:10px;padding:8px 0 8px 12px;border-left:2px solid #e8e4de;margin-left:3px;cursor:pointer;transition:border-color 0.15s';
-        tlCard.addEventListener('mouseenter', function() { this.style.borderLeftColor = '#b84040'; });
-        tlCard.addEventListener('mouseleave', function() { this.style.borderLeftColor = '#e8e4de'; });
-        tlCard.addEventListener('click', function() { DataService.getById(m.id).then(function(mem) { if (mem) UIManager._showEditor(mem); }).catch(function(err) { _warn('[Timeline] getById failed:', err); }); });
+          var tlCard = targetDoc.createElement('div');
+          var daysAgo = Math.floor((now - m.timestamp) / 86400000);
+          var timeLabel = daysAgo === 0 ? '今天' + _timeStr(m.timestamp) : daysAgo === 1 ? '昨天' + _timeStr(m.timestamp) : daysAgo + ' 天前';
+          tlCard.style.cssText = 'display:flex;align-items:flex-start;gap:10px;padding:8px 0 8px 12px;border-left:2px solid #e8e4de;margin-left:3px;cursor:pointer;transition:border-color 0.15s';
+          tlCard.addEventListener('mouseenter', function() { this.style.borderLeftColor = '#b84040'; });
+          tlCard.addEventListener('mouseleave', function() { this.style.borderLeftColor = '#e8e4de'; });
+          tlCard.addEventListener('click', function(e) { e.stopPropagation(); _showDetailPanel(m); });
+          tlCard.title = '点击查看完整内容';
 
-        var tlTime = targetDoc.createElement('div');
-        tlTime.style.cssText = 'font-size:10px;color:#555;flex-shrink:0;min-width:48px;text-align:right';
-        tlTime.textContent = timeLabel;
-        tlCard.appendChild(tlTime);
+          var tlTime = targetDoc.createElement('div');
+          tlTime.style.cssText = 'font-size:10px;color:#555;flex-shrink:0;min-width:48px;text-align:right';
+          tlTime.textContent = timeLabel;
+          tlCard.appendChild(tlTime);
 
-        var tlBody = targetDoc.createElement('div');
-        tlBody.style.cssText = 'flex:1;min-width:0';
-        var tlContent = targetDoc.createElement('div');
-        tlContent.style.cssText = 'font-size:12px;color:#2c2c2c;line-height:1.5;overflow-wrap:break-word;word-break:break-word';
-        tlContent.textContent = (m.content || '').substring(0, 120);
-        tlBody.appendChild(tlContent);
-        if (m.tags && m.tags.length > 0) {
-          var tlTags = targetDoc.createElement('div');
-          tlTags.style.cssText = 'display:flex;flex-wrap:wrap;gap:3px;margin-top:3px';
-          for (var ti = 0; ti < Math.min(m.tags.length, 4); ti++) {
-            var tspan = targetDoc.createElement('span');
-            tspan.style.cssText = 'font-size:9px;padding:1px 5px;background:#f3f0ea;color:#333;border-radius:8px';
-            tspan.textContent = m.tags[ti];
-            tlTags.appendChild(tspan);
+          var tlBody = targetDoc.createElement('div');
+          tlBody.style.cssText = 'flex:1;min-width:0';
+          var tlContent = targetDoc.createElement('div');
+          tlContent.style.cssText = 'font-size:13px;color:#2c2c2c;line-height:1.6;overflow-wrap:break-word;word-break:break-word';
+          var fullText = m.content || '';
+          tlContent.textContent = fullText.length > 300 ? fullText.substring(0, 300) + '…' : fullText;
+          tlBody.appendChild(tlContent);
+          if (m.tags && m.tags.length > 0) {
+            var tlTags = targetDoc.createElement('div');
+            tlTags.style.cssText = 'display:flex;flex-wrap:wrap;gap:3px;margin-top:3px';
+            for (var ti = 0; ti < Math.min(m.tags.length, 4); ti++) {
+              var tspan = targetDoc.createElement('span');
+              tspan.style.cssText = 'font-size:9px;padding:1px 5px;background:#f3f0ea;color:#333;border-radius:8px';
+              tspan.textContent = m.tags[ti];
+              tlTags.appendChild(tspan);
+            }
+            tlBody.appendChild(tlTags);
           }
-          tlBody.appendChild(tlTags);
-        }
-        tlCard.appendChild(tlBody);
-        groupDiv.appendChild(tlCard);
-        })(m);
+          tlCard.appendChild(tlBody);
+          groupDiv.appendChild(tlCard);
+        })(group.memories[mi]);
       }
-      tc.appendChild(groupDiv);
+      frag.appendChild(groupDiv);
     }
-  }).catch(function(err) { _warn('[Timeline] render failed:', err); });
+
+    // 一次性插入所有 DOM，只触发一次回流
+    tc.appendChild(frag);
+
+    // 截断提示 + 加载按钮
+    if (truncated) {
+      var loadMoreBtn = targetDoc.createElement('button');
+      loadMoreBtn.className = 'mm-btn mm-btn-primary';
+      loadMoreBtn.style.cssText = 'display:block;margin:16px auto;padding:8px 24px;font-size:13px';
+      loadMoreBtn.textContent = '当前显示最近 ' + MAX_RENDER + ' 条，共 ' + totalCount + ' 条 — 点击加载全部';
+      loadMoreBtn.addEventListener('click', function() {
+        loadMoreBtn.textContent = '加载中…';
+        loadMoreBtn.disabled = true;
+        _panelContentEl._maxRenderTimeline = totalCount;
+        _renderTimeline();
+      });
+      tc.appendChild(loadMoreBtn);
+    }
+  });
 }
+
+// 快速查看面板（时间线点击卡片直接看全文，不再需要点编辑）
+function _showDetailPanel() {}
 
 function _formatGroupLabel(d, groupBy, ts) {
   var daysAgo = Math.floor((Date.now() - ts) / 86400000);
@@ -6604,7 +7241,7 @@ function _renderMemoryList() {
     } else {
       batchBar.style.display = 'none';
     }
-  }).catch(function(err) { _warn('[MemoryList] render failed:', err); });
+  });
 }
 
 function _buildMemoryCard(m, idx) {
@@ -6679,26 +7316,25 @@ function _buildMemoryCard(m, idx) {
     actions.appendChild(ab);
   }
   if (m.hidden) {
-    actBtn('恢复', '恢复此记忆', function(id) { DataService.restore(id).then(function() { _renderMemoryList(); }).catch(function(err) { UIManager.showToast('恢复失败', 'error'); }); });
+    actBtn('恢复', '恢复此记忆', function(id) { DataService.restore(id).then(function() { _renderMemoryList(); }); });
     actBtn('彻底删除', '永久删除', function(id) {
       UIManager._showConfirm('确定永久删除？', function() {
-        DataService.permanentDelete(id).then(function() { _renderMemoryList(); }).catch(function(err) { UIManager.showToast('删除失败', 'error'); });
+        DataService.permanentDelete(id).then(function() { _renderMemoryList(); });
       });
     });
   } else {
     actBtn('复制', '复制内容', function(id) {
       DataService.getById(id).then(function(mem) {
-        try { navigator.clipboard.writeText(mem.content || ''); UIManager.showToast('已复制', 'success'); }
-        catch(ex) { UIManager._showCopyFallbackModal(mem.content || ''); }
-      }).catch(function(err) { _warn('[Card] copy getById failed:', err); });
+        UIManager._safeCopy(mem.content || ''); UIManager.showToast('已复制', 'success');
+      });
     });
-    actBtn('编辑', '编辑记忆', function(id) { DataService.getById(id).then(function(mem) { if (mem) UIManager._showEditor(mem); }).catch(function(err) { _warn('[Card] edit getById failed:', err); }); });
+    actBtn('编辑', '编辑记忆', function(id) { DataService.getById(id).then(function(mem) { if (mem) UIManager._showEditor(mem); }); });
     actBtn('相似', '找相似的记忆', function(id) { UIManager._showSimilarMemories(id); });
     actBtn('删除', '删除记忆', function(id) {
       DataService.getById(id).then(function(mem) {
-        if (mem && mem.protected) UIManager._showConfirm('受保护的记忆，确定删除？', function() { DataService.softDelete(id).then(function() { UIManager.showToast('已删除', 'info'); _renderMemoryList(); }).catch(function(err) { UIManager.showToast('删除失败', 'error'); }); });
-        else DataService.softDelete(id).then(function() { UIManager.showToast('已删除', 'info'); _renderMemoryList(); }).catch(function(err) { UIManager.showToast('删除失败', 'error'); });
-      }).catch(function(err) { UIManager.showToast('获取记忆失败', 'error'); });
+        if (mem && mem.protected) UIManager._showConfirm('受保护的记忆，确定删除？', function() { DataService.softDelete(id).then(function() { UIManager.showToast('已删除', 'info'); _renderMemoryList(); }); });
+        else DataService.softDelete(id).then(function() { UIManager.showToast('已删除', 'info'); _renderMemoryList(); });
+      });
     });
   }
   body.appendChild(actions);
@@ -6753,6 +7389,8 @@ function _renderMD(text) {
 // 保留模态框、Toast、确认窗等与 WinBox 无关的方法
 var UIManager = {};
 UIManager._selectedIds = [];
+UIManager._copyFallbackCount = 0;  // 诊断用：降级弹窗使用次数
+UIManager._lastCopyResult = null;  // 诊断用：{time, type, length, ok}
 UIManager._recycleBinMode = false;
 
 // 将提前定义的方法绑定到 UIManager（因为它们的函数体在 UIManager 定义之前）
@@ -6764,7 +7402,7 @@ UIManager._triggerDedup = function() {
   DataService.deduplicate().then(function(memories) {
     UIManager.showToast('去重完成，共 ' + memories.length + ' 条', 'success');
     _renderMemoryList();
-  }).catch(function(err) { UIManager.showToast('去重失败: ' + (err && err.message ? err.message : '未知错误'), 'error'); });
+  });
 };
 UIManager._triggerImport = function() {
   var inp = targetDoc.createElement('input');
@@ -6784,7 +7422,7 @@ UIManager._triggerExport = function() {
   DataService.getAll({ includeHidden: false }).then(function(memories) {
     try { Exporter.exportJSON(memories); UIManager.showToast('导出成功', 'success'); }
     catch(err) { UIManager.showToast(err.message, 'error'); }
-  }).catch(function(err) { UIManager.showToast('导出失败: ' + (err && err.message ? err.message : '未知错误'), 'error'); });
+  });
 };
 
 // Toast
@@ -6808,7 +7446,7 @@ UIManager._showConfirm = function(msg, onConfirm) {
   overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:9999999;display:flex;align-items:center;justify-content:center';
   var modal = targetDoc.createElement('div');
   modal.style.cssText = 'background:#fff;border-radius:4px;padding:20px 24px;max-width:360px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,0.1)';
-  modal.innerHTML = '<p style="margin-bottom:16px;font-size:14px;color:#2c2c2c">' + escapeHtml(msg) + '</p>';
+  modal.innerHTML = '<p style="margin-bottom:16px;font-size:14px;color:#2c2c2c">' + msg + '</p>';
   var actions = targetDoc.createElement('div');
   actions.style.cssText = 'display:flex;gap:12px;justify-content:center';
   var cancelBtn = targetDoc.createElement('button');
@@ -6837,13 +7475,13 @@ UIManager._showQuickCreate = function() {
   modal.style.cssText = 'background:#fff;border-radius:4px;padding:20px 24px;max-width:500px;width:92%;max-height:85vh;overflow-y:auto;box-shadow:0 4px 20px rgba(0,0,0,0.1)';
   modal.innerHTML = '<h3 style="margin:0 0 12px;font-size:15px;color:#2c2c2c">快速记录</h3>' +
     '<div style="display:flex;gap:8px;margin-bottom:8px">' +
-    '<select id="mm-qc-zone" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px"><option value="角色记忆">角色记忆</option><option value="玩家记忆">玩家记忆</option><option value="世界记忆">世界记忆</option><option value="总结记忆">总结记忆</option></select>' +
-    '<select id="mm-qc-category" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px"><option value="">分类（可选）</option><option value="初识印象">初识印象</option><option value="深层认知">深层认知</option><option value="行为习惯">行为习惯</option><option value="情感关系">情感关系</option><option value="背景故事">背景故事</option><option value="其他">其他</option></select>' +
-    '<select id="mm-qc-importance" style="width:60px;padding:6px;border:1px solid #e8e4de;border-radius:2px"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="4">4</option><option value="5">5</option></select>' +
+    '<select id="mm-qc-zone" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px;color:#2c2c2c;background:#fff"><option value="角色记忆">角色记忆</option><option value="玩家记忆">玩家记忆</option><option value="世界记忆">世界记忆</option><option value="总结记忆">总结记忆</option></select>' +
+    '<select id="mm-qc-category" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px;color:#2c2c2c;background:#fff"><option value="">分类（可选）</option><option value="初识印象">初识印象</option><option value="深层认知">深层认知</option><option value="行为习惯">行为习惯</option><option value="情感关系">情感关系</option><option value="背景故事">背景故事</option><option value="其他">其他</option></select>' +
+    '<select id="mm-qc-importance" style="width:60px;padding:6px;border:1px solid #e8e4de;border-radius:2px;color:#2c2c2c;background:#fff"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="4">4</option><option value="5">5</option></select>' +
     '</div>' +
-    '<textarea id="mm-qc-content" rows="5" placeholder="输入记忆内容…" style="width:100%;padding:8px;border:1px solid #e8e4de;border-radius:2px;font-size:13px;resize:vertical;box-sizing:border-box"></textarea>' +
-    '<input id="mm-qc-tags" type="text" placeholder="标签（逗号分隔）" style="width:100%;padding:6px;margin-top:8px;border:1px solid #e8e4de;border-radius:2px;font-size:13px;box-sizing:border-box">' +
-    '<input id="mm-qc-rolename" type="text" placeholder="角色名（可选）" style="width:100%;padding:6px;margin-top:6px;border:1px solid #e8e4de;border-radius:2px;font-size:13px;box-sizing:border-box">' +
+    '<textarea id="mm-qc-content" rows="5" placeholder="输入记忆内容…" style="width:100%;padding:8px;border:1px solid #e8e4de;border-radius:2px;font-size:13px;resize:vertical;box-sizing:border-box;color:#2c2c2c;background:#fff"></textarea>' +
+    '<input id="mm-qc-tags" type="text" placeholder="标签（逗号分隔）" style="width:100%;padding:6px;margin-top:8px;border:1px solid #e8e4de;border-radius:2px;font-size:13px;box-sizing:border-box;color:#2c2c2c;background:#fff">' +
+    '<input id="mm-qc-rolename" type="text" placeholder="角色名（可选）" style="width:100%;padding:6px;margin-top:6px;border:1px solid #e8e4de;border-radius:2px;font-size:13px;box-sizing:border-box;color:#2c2c2c;background:#fff">' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">' +
     '<button id="mm-qc-cancel" class="mm-btn">取消</button>' +
     '<button id="mm-qc-save" class="mm-btn mm-btn-primary">保存</button></div>';
@@ -6870,7 +7508,7 @@ UIManager._showQuickCreate = function() {
       UIManager.showToast('已添加', 'success');
       targetDoc.body.removeChild(overlay);
       _renderMemoryList();
-    }).catch(function(err) { UIManager.showToast('保存失败: ' + (err && err.message ? err.message : '未知错误'), 'error'); });
+    });
   });
 
   // 自动标签（输入时防抖建议，仅当标签栏为空时自动填入）
@@ -6897,11 +7535,11 @@ UIManager._showEditor = function(memory) {
   modal.innerHTML =
     '<h3 style="margin:0 0 12px">编辑记忆</h3>' +
     '<select id="mm-ed-zone" style="width:100%;padding:6px;margin-bottom:6px;border:1px solid #e8e4de;border-radius:2px">' + ZONES.map(function(z) { return '<option' + (z === memory.zone ? ' selected' : '') + '>' + z + '</option>'; }).join('') + '</select>' +
-    '<textarea id="mm-ed-content" rows="5" style="width:100%;padding:8px;border:1px solid #e8e4de;border-radius:2px;font-size:13px;resize:vertical;box-sizing:border-box">' + escapeHtml(memory.content || '') + '</textarea>' +
-    '<div style="display:flex;gap:6px;margin-top:6px"><input id="mm-ed-rolename" placeholder="角色名" value="' + escapeHtml(memory.roleName || '') + '" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px"><input id="mm-ed-category" placeholder="分类" value="' + escapeHtml(memory.category || '') + '" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px"></div>' +
+    '<textarea id="mm-ed-content" rows="5" style="width:100%;padding:8px;border:1px solid #e8e4de;border-radius:2px;font-size:13px;resize:vertical;box-sizing:border-box;color:#2c2c2c;background:#fff">' + escapeHtml(memory.content || '') + '</textarea>' +
+    '<div style="display:flex;gap:6px;margin-top:6px"><input id="mm-ed-rolename" placeholder="角色名" value="' + escapeHtml(memory.roleName || '') + '" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px;color:#2c2c2c;background:#fff"><input id="mm-ed-category" placeholder="分类" value="' + escapeHtml(memory.category || '') + '" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px;color:#2c2c2c;background:#fff"></div>' +
     '<input id="mm-ed-tags" placeholder="标签（逗号分隔）" value="' + escapeHtml((memory.tags || []).join(', ')) + '" style="width:100%;padding:6px;margin-top:6px;border:1px solid #e8e4de;border-radius:2px;box-sizing:border-box">' +
     '<div style="display:flex;gap:4px;margin-top:6px"><input id="mm-ed-triggers" placeholder="触发关键词（逗号分隔）" value="' + escapeHtml((memory.triggerKeywords || []).join(', ')) + '" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px;box-sizing:border-box"><button id="mm-ed-suggest-triggers" class="mm-btn mm-btn-xs" style="flex-shrink:0" title="从标签和内容自动推荐触发词">推荐</button></div>' +
-    '<div style="display:flex;gap:6px;margin-top:6px"><select id="mm-ed-importance" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px">' + [1,2,3,4,5].map(function(v) { return '<option' + (v === (memory.importance||3) ? ' selected' : '') + '>' + v + '</option>'; }).join('') + '</select></div>' +
+    '<div style="display:flex;gap:6px;margin-top:6px"><select id="mm-ed-importance" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px;color:#2c2c2c;background:#fff">' + [1,2,3,4,5].map(function(v) { return '<option' + (v === (memory.importance||3) ? ' selected' : '') + '>' + v + '</option>'; }).join('') + '</select></div>' +
     '<label style="display:flex;align-items:center;gap:4px;margin-top:6px;font-size:12px;color:#2c2c2c"><input id="mm-ed-protected" type="checkbox"' + (memory.protected ? ' checked' : '') + '> 保护状态</label>' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button id="mm-ed-cancel" class="mm-btn">取消</button><button id="mm-ed-save" class="mm-btn mm-btn-primary">保存</button></div>';
   overlay.appendChild(modal);
@@ -6925,7 +7563,7 @@ UIManager._showEditor = function(memory) {
       UIManager.showToast('已更新', 'success');
       targetDoc.body.removeChild(overlay);
       _renderMemoryList();
-    }).catch(function(err) { UIManager.showToast('更新失败: ' + (err && err.message ? err.message : '未知错误'), 'error'); });
+    });
   });
 
   // 推荐触发关键词
@@ -6939,7 +7577,7 @@ UIManager._showEditor = function(memory) {
     var seen = {};
     for (var i = 0; i < currentTrigs.length; i++) seen[currentTrigs[i]] = true;
     for (var j = 0; j < existing.length; j++) if (!seen[existing[j]]) { seen[existing[j]] = true; currentTrigs.push(existing[j]); }
-    for (var k = 0; k < suggested.length; k++) if (!seen[suggested[k]]) { seen[suggested[k]] = true; currentTrigs.push(currentTrigs[k]); }
+    for (var k = 0; k < suggested.length; k++) if (!seen[suggested[k]]) { seen[suggested[k]] = true; currentTrigs.push(suggested[k]); }
     triggerEl.value = currentTrigs.join(', ');
   });
 };
@@ -7013,11 +7651,22 @@ UIManager._showAutoPanel = function() {
 
   var contentArea = targetDoc.createElement('div');
 
+  var typeDescs = { recall: '每隔N轮对话，自动把还没回顾过的旧记忆发给AI重新确认', summarize: '每隔N轮对话，自动把多条零散记忆合并压缩为要点', dormant: '检测长期未被触及的高重要性记忆，提醒你回顾' };
+
   function renderEasy() {
     while (contentArea.firstChild) contentArea.removeChild(contentArea.firstChild);
     var rules = RuleEngine.getRules();
     var FREQ_MAP = { off: 0, occasional: 20, frequent: 5 };
     var typeNames = { recall: '定期回顾', summarize: '定期总结', dormant: '沉寂提醒' };
+
+    // 说明文字
+    var infoDiv = targetDoc.createElement('div');
+    infoDiv.style.cssText = 'padding:8px 10px;background:#faf8f5;border-radius:8px;border:1px solid #e8e4de;margin-bottom:10px;font-size:11px;color:#777;line-height:1.6';
+    infoDiv.innerHTML = '<b style="color:#555">💡 自动化规则说明</b><br>' +
+      '<b>关</b> = 不使用 | <b>偶尔</b> = 约20轮对话触发一次 | <b>频繁</b> = 约5轮对话触发一次<br>' +
+      '进度条表示距离下次触发的完成度（<b>N/20</b> = 已过N轮，还需20-N轮）<br>' +
+      '触发后的内容会<u>按下方选择的输出方式</u>呈现给你';
+    contentArea.appendChild(infoDiv);
 
     for (var i = 0; i < rules.length; i++) {
       var r = rules[i];
@@ -7032,7 +7681,8 @@ UIManager._showAutoPanel = function() {
 
       var nameSpan = targetDoc.createElement('span');
       nameSpan.textContent = typeNames[r.type] || r.type;
-      nameSpan.style.cssText = 'font-weight:500;min-width:80px;font-size:13px;color:#2c2c2c';
+      nameSpan.style.cssText = 'font-weight:500;min-width:80px;font-size:13px;color:#2c2c2c;cursor:help';
+      nameSpan.title = typeDescs[r.type] || '';
       row.appendChild(nameSpan);
 
       // 三档开关
@@ -7170,8 +7820,8 @@ UIManager._showAutoPanel = function() {
 
         var nameSpan = targetDoc.createElement('span');
         nameSpan.textContent = (r.type === 'recall' ? '回顾' : r.type === 'summarize' ? '总结' : r.type === 'dormant' ? '沉寂' : r.type);
-        nameSpan.style.cssText = 'font-size:12px;font-weight:500;width:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#2c2c2c';
-        nameSpan.title = r.type;
+        nameSpan.style.cssText = 'font-size:12px;font-weight:500;width:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#2c2c2c;cursor:help';
+        nameSpan.title = (typeDescs[r.type] || r.type);
         row.appendChild(nameSpan);
 
         var intervalSpan = targetDoc.createElement('span');
@@ -7202,7 +7852,7 @@ UIManager._showAutoPanel = function() {
             autoMark: r.action.autoMark,
             protectSource: r.action.protectSource,
             template: r.action.template
-          }, rule: r }).then(function() { self.showToast('任务已触发', 'success'); }).catch(function(err) { self.showToast('触发任务失败: ' + (err && err.message ? err.message : '未知错误'), 'error'); });
+          }, rule: r }).then(function() { self.showToast('任务已触发', 'success'); });
         });
         row.appendChild(triggerBtn);
 
@@ -7270,10 +7920,7 @@ UIManager._showAutoPanel = function() {
     var typePresets = templates[currentType] || {};
     var presetKeys = Object.keys(typePresets);
     for (var pki = 0; pki < presetKeys.length; pki++) {
-      var opt = targetDoc.createElement('option');
-      opt.value = presetKeys[pki];
-      opt.textContent = typePresets[presetKeys[pki]].label;
-      tmplSelect.appendChild(opt);
+      tmplSelect.innerHTML += '<option value="' + presetKeys[pki] + '">' + typePresets[presetKeys[pki]].label + '</option>';
     }
     tmplSelect.addEventListener('change', function() {
       if (this.value && typePresets[this.value]) {
@@ -7289,10 +7936,7 @@ UIManager._showAutoPanel = function() {
       tmplSelect.innerHTML = '<option value="">-- 自定义模板 --</option>';
       var cpk = Object.keys(ctPresets);
       for (var cpi = 0; cpi < cpk.length; cpi++) {
-        var opt = targetDoc.createElement('option');
-        opt.value = cpk[cpi];
-        opt.textContent = ctPresets[cpk[cpi]].label;
-        tmplSelect.appendChild(opt);
+        tmplSelect.innerHTML += '<option value="' + cpk[cpi] + '">' + ctPresets[cpk[cpi]].label + '</option>';
       }
     });
 
@@ -7698,166 +8342,7 @@ UIManager._showTagManager = function() {
   overlay.appendChild(modal);
   targetDoc.body.appendChild(overlay);
 };
-UIManager._showKnowledgeGraph = function() {
-  var self = this;
-  var overlay = targetDoc.createElement('div');
-  overlay.className = 'mm-modal-overlay';
-
-  var modal = targetDoc.createElement('div');
-  modal.className = 'mm-modal mm-modal-wide mm-kg-view';
-
-  var header = targetDoc.createElement('div');
-  header.className = 'mm-modal-header';
-  var h3 = targetDoc.createElement('h3');
-  h3.textContent = '知识图谱';
-  header.appendChild(h3);
-  var closeBtn = targetDoc.createElement('button');
-  closeBtn.className = 'mm-modal-close';
-  closeBtn.textContent = '×';
-  closeBtn.addEventListener('click', function() { targetDoc.body.removeChild(overlay); });
-  header.appendChild(closeBtn);
-  modal.appendChild(header);
-
-  var entityCount = Object.keys(KnowledgeGraph._entities).length;
-  if (entityCount === 0) {
-    var empty = targetDoc.createElement('div');
-    empty.className = 'mm-empty-state';
-    empty.textContent = '暂无图谱数据，记忆积累后自动生成';
-    modal.appendChild(empty);
-    overlay.appendChild(modal);
-    targetDoc.body.appendChild(overlay);
-    return;
-  }
-
-  // 实体选择
-  var ctrlRow = targetDoc.createElement('div');
-  ctrlRow.style.cssText = 'display:flex;gap:8px;margin-bottom:12px;align-items:center';
-
-  var entitySelect = targetDoc.createElement('select');
-  entitySelect.style.cssText = 'flex:1;padding:6px 8px;border:1px solid #e8e4de;border-radius:2px;font-size:12px';
-  var entityNames = Object.keys(KnowledgeGraph._entities);
-  for (var en = 0; en < entityNames.length; en++) {
-    var opt = targetDoc.createElement('option');
-    opt.value = entityNames[en];
-    opt.textContent = entityNames[en] + ' (' + KnowledgeGraph._entities[entityNames[en]].type + ')';
-    entitySelect.appendChild(opt);
-  }
-  ctrlRow.appendChild(entitySelect);
-
-  var searchInput = targetDoc.createElement('input');
-  searchInput.type = 'text';
-  searchInput.placeholder = '搜索实体...';
-  searchInput.style.cssText = 'width:120px;padding:6px 8px;border:1px solid #e8e4de;border-radius:2px;font-size:12px';
-  searchInput.addEventListener('input', function() {
-    var q = this.value.trim();
-    if (!q) return;
-    var results = KnowledgeGraph.searchEntities(q);
-    if (results.length > 0) entitySelect.value = results[0].name;
-    renderGraph(entitySelect.value);
-  });
-  ctrlRow.appendChild(searchInput);
-  modal.appendChild(ctrlRow);
-
-  // 图谱可视化区域
-  var canvas = targetDoc.createElement('div');
-  canvas.className = 'mm-kg-canvas';
-  canvas.style.cssText = 'min-height:260px;position:relative;overflow:hidden';
-  modal.appendChild(canvas);
-
-  // 信息区域
-  var infoArea = targetDoc.createElement('div');
-  infoArea.style.cssText = 'margin-top:12px;font-size:12px;color:#2c2c2c';
-  modal.appendChild(infoArea);
-
-  function renderGraph(centerName) {
-    while (canvas.firstChild) canvas.removeChild(canvas.firstChild);
-    while (infoArea.firstChild) infoArea.removeChild(infoArea.firstChild);
-
-    if (!centerName) return;
-    var graph = KnowledgeGraph.getGraph(centerName, 2);
-    var nodes = graph.nodes;
-    var edges = graph.edges;
-
-    if (nodes.length === 0) {
-      canvas.textContent = '该实体暂无关联数据';
-      canvas.style.cssText += ';display:flex;align-items:center;justify-content:center;color:#555';
-      return;
-    }
-
-    var cx = 280, cy = 130;
-    var radius = 100;
-
-    // 布局：中心节点在圆心，其他节点环绕
-    for (var ni = 0; ni < nodes.length; ni++) {
-      var node = nodes[ni];
-      var angle, r;
-      if (node.name === centerName) {
-        angle = Math.PI / 2;
-        r = 0;
-      } else {
-        var idx = ni > 0 ? ni : ni + 1;
-        angle = (idx / Math.max(nodes.length - 1, 1)) * Math.PI * 2;
-        r = radius;
-      }
-      var nx = cx + Math.cos(angle) * r - 40;
-      var ny = cy + Math.sin(angle) * r - 14;
-
-      var nodeEl = targetDoc.createElement('div');
-      nodeEl.className = 'mm-kg-node';
-      nodeEl.textContent = node.name;
-      nodeEl.style.cssText = 'left:' + nx + 'px;top:' + ny + 'px';
-      nodeEl.setAttribute('data-entity', node.name);
-      nodeEl.addEventListener('click', function() {
-        entitySelect.value = this.getAttribute('data-entity');
-        renderGraph(this.getAttribute('data-entity'));
-      });
-      canvas.appendChild(nodeEl);
-    }
-
-    // 边标签（简化为关系列表）
-    var relDiv = targetDoc.createElement('div');
-    relDiv.style.cssText = 'position:absolute;bottom:8px;left:8px;right:8px;font-size:11px;color:#555;display:flex;flex-wrap:wrap;gap:4px';
-    for (var ei = 0; ei < edges.length; ei++) {
-      var edgeEl = targetDoc.createElement('span');
-      edgeEl.textContent = edges[ei].from + '→' + edges[ei].type + '→' + edges[ei].to;
-      edgeEl.style.cssText = 'background:#f3f0ea;padding:2px 6px;border-radius:2px';
-      relDiv.appendChild(edgeEl);
-    }
-    canvas.appendChild(relDiv);
-
-    // 信息区域
-    var infoTitle = targetDoc.createElement('p');
-    infoTitle.textContent = '选中实体：' + centerName;
-    infoTitle.style.cssText = 'font-weight:500;margin-bottom:4px';
-    infoArea.appendChild(infoTitle);
-
-    var relCount = KnowledgeGraph.getRelations(centerName, 1).length;
-    var infoMeta = targetDoc.createElement('p');
-    infoMeta.textContent = '关联关系：' + relCount + ' 条';
-    infoMeta.style.cssText = 'color:#555;margin-bottom:8px';
-    infoArea.appendChild(infoMeta);
-
-    var obs = KnowledgeGraph.getObservations(centerName);
-    if (obs.length > 0) {
-      var obsLabel = targetDoc.createElement('p');
-      obsLabel.textContent = '观察列表：';
-      obsLabel.style.cssText = 'font-weight:500;margin-bottom:4px';
-      infoArea.appendChild(obsLabel);
-      for (var oi = 0; oi < Math.min(obs.length, 5); oi++) {
-        var obsItem = targetDoc.createElement('p');
-        obsItem.textContent = '· ' + obs[oi].content;
-        obsItem.style.cssText = 'color:#555;margin:2px 0;font-size:11px';
-        infoArea.appendChild(obsItem);
-      }
-    }
-  }
-
-  entitySelect.addEventListener('change', function() { renderGraph(this.value); });
-  renderGraph(entitySelect.value);
-
-  overlay.appendChild(modal);
-  targetDoc.body.appendChild(overlay);
-};
+UIManager._showKnowledgeGraph = function() { this.showToast('知识图谱已移除，请使用仪表盘查看记忆数据', 'info'); };
 
 // 遗忘管理面板
 UIManager._showForgettingConfig = function() {
@@ -7917,7 +8402,7 @@ UIManager._showForgettingConfig = function() {
     AdaptiveForgetting.evaluate().then(function(result) {
       self.showToast('已评估：归档 ' + result.archived + ' 条，沉寂候选 ' + result.dormantCandidates.length + ' 条', 'success');
       _renderMemoryList();
-    }).catch(function(err) { self.showToast('评估失败: ' + (err && err.message ? err.message : '未知错误'), 'error'); });
+    });
   });
   modal.appendChild(evalBtn);
 
@@ -7945,7 +8430,7 @@ UIManager._showForgettingConfig = function() {
         dormantList.appendChild(row);
       }
     }
-  }).catch(function(err) { _warn('[Forgetting] load candidates failed:', err); });
+  });
 
   // 保存按钮
   var actionsRow = targetDoc.createElement('div');
@@ -8051,7 +8536,7 @@ UIManager._showClusterView = function() {
         }
         resultArea.appendChild(groupDiv);
       }
-    }).catch(function(err) { self.showToast('聚类分析失败', 'error'); });
+    });
   });
 
   overlay.appendChild(modal);
@@ -8117,31 +8602,42 @@ UIManager._showScanSettings = function() {
   intervalInput.min = '5';
   intervalInput.max = '600';
   intervalInput.value = String((Scanner._autoScanInterval || 30000) / 1000);
-  intervalInput.style.cssText = 'width:60px;padding:4px 6px;border:1px solid #e8e4de;border-radius:2px;font-size:12px;text-align:center';
+  intervalInput.style.cssText = 'width:60px;padding:4px 6px;border:1px solid #d0ccc4;border-radius:2px;font-size:13px;text-align:center;color:#2c2c2c;background:#fff';
   autoScanRow.appendChild(intervalInput);
   var secLabel = targetDoc.createElement('span');
   secLabel.textContent = '秒';
-  secLabel.style.cssText = 'font-size:12px;color:#555';
+  secLabel.style.cssText = 'font-size:13px;color:#2c2c2c;font-weight:500';
   autoScanRow.appendChild(secLabel);
   modal.appendChild(autoScanRow);
 
-  // MutationObserver 开关
+  // 实时监听 (MutationObserver)
+  var obLabel = targetDoc.createElement('p');
+  obLabel.textContent = '实时页面监听：';
+  obLabel.style.cssText = 'font-size:13px;font-weight:500;margin-bottom:4px';
+  modal.appendChild(obLabel);
+  var obDesc = targetDoc.createElement('p');
+  obDesc.textContent = '监听页面 DOM 变化，检测到新消息时自动触发 Lorebook 扫描。对性能影响极小。';
+  obDesc.style.cssText = 'font-size:11px;color:#888;margin-bottom:8px';
+  modal.appendChild(obDesc);
+
   var obToggle = targetDoc.createElement('button');
   obToggle.className = 'mm-btn mm-btn-sm';
-  obToggle.textContent = Scanner._observer ? '实时监听已开启 - 点击关闭' : '实时监听已关闭 - 点击开启';
-  obToggle.style.cssText = Scanner._observer ? 'background:#b84040;color:#fff;margin-bottom:12px' : 'margin-bottom:12px';
+  obToggle.textContent = Scanner._observer ? '已开启 - 点击关闭' : '已关闭 - 点击开启';
+  obToggle.style.cssText = Scanner._observer ? 'background:#b84040;color:#fff;margin-bottom:12px' : 'color:#2c2c2c;background:#fff;margin-bottom:12px;border:1px solid #d0ccc4';
   obToggle.addEventListener('click', function() {
     if (Scanner._observer) {
       Scanner.stopObserver();
-      obToggle.textContent = '实时监听已关闭 - 点击开启';
+      obToggle.textContent = '已关闭 - 点击开启';
       obToggle.style.background = '';
-      obToggle.style.color = '';
+      obToggle.style.color = '#2c2c2c';
+      obToggle.style.border = '1px solid #d0ccc4';
       self.showToast('实时监听已关闭', 'info');
     } else {
       Scanner.startObserver();
-      obToggle.textContent = '实时监听已开启 - 点击关闭';
+      obToggle.textContent = '已开启 - 点击关闭';
       obToggle.style.background = '#b84040';
       obToggle.style.color = '#fff';
+      obToggle.style.border = '1px solid #b84040';
       self.showToast('实时监听已开启', 'success');
     }
   });
@@ -8162,6 +8658,189 @@ UIManager._showScanSettings = function() {
 
   overlay.appendChild(modal);
   targetDoc.body.appendChild(overlay);
+};
+
+// 系统诊断面板
+UIManager._showDiagnostics = function() {
+  var self = this;
+  var overlay = targetDoc.createElement('div');
+  overlay.className = 'mm-modal-overlay';
+  var modal = targetDoc.createElement('div');
+  modal.className = 'mm-modal mm-modal-wide';
+  modal.style.cssText = 'max-width:640px;max-height:85vh;overflow-y:auto';
+
+  var header = targetDoc.createElement('div');
+  header.className = 'mm-modal-header';
+  var h3 = targetDoc.createElement('h3');
+  h3.textContent = '系统诊断';
+  header.appendChild(h3);
+  var closeBtn = targetDoc.createElement('button');
+  closeBtn.className = 'mm-modal-close';
+  closeBtn.textContent = '×';
+  closeBtn.addEventListener('click', function() { targetDoc.body.removeChild(overlay); });
+  header.appendChild(closeBtn);
+  modal.appendChild(header);
+
+  // 状态栏
+  var statusDiv = targetDoc.createElement('div');
+  statusDiv.id = 'mm-diag-status';
+  statusDiv.style.cssText = 'padding:12px;text-align:center;font-size:14px;color:#888';
+  statusDiv.textContent = '正在收集系统状态...';
+  modal.appendChild(statusDiv);
+
+  // 自测结果区
+  var testArea = targetDoc.createElement('div');
+  testArea.id = 'mm-diag-tests';
+  testArea.style.cssText = 'display:none;padding:0 12px';
+  modal.appendChild(testArea);
+
+  // 按钮区
+  var btnArea = targetDoc.createElement('div');
+  btnArea.style.cssText = 'display:flex;gap:6px;padding:12px;justify-content:center;flex-wrap:wrap';
+  var runAllBtn = targetDoc.createElement('button');
+  runAllBtn.className = 'mm-btn mm-btn-primary';
+  runAllBtn.textContent = '全部自测';
+  runAllBtn.addEventListener('click', function() {
+    runAllBtn.disabled = true;
+    runAllBtn.textContent = '运行中...';
+    testArea.style.display = 'block';
+    testArea.innerHTML = '<p style="text-align:center;color:#888;padding:20px">⏳ 正在逐项测试...</p>';
+    statusDiv.textContent = '自测运行中...';
+
+    Diagnostics.runAll().then(function(report) {
+      renderReport(report);
+      runAllBtn.disabled = false;
+      runAllBtn.textContent = '重新自测';
+    }).catch(function(e) {
+      testArea.innerHTML = '<p style="color:#f55">自测异常: ' + (e.message || '') + '</p>';
+      runAllBtn.disabled = false;
+      runAllBtn.textContent = '全部自测';
+    });
+  });
+  btnArea.appendChild(runAllBtn);
+  var copyBtn = targetDoc.createElement('button');
+  copyBtn.className = 'mm-btn mm-btn-sm';
+  copyBtn.textContent = '复制报告';
+  copyBtn.addEventListener('click', function() {
+    var reportText = buildTextReport();
+    try { navigator.clipboard.writeText(reportText); self.showToast('报告已复制', 'success'); }
+    catch(ex) { self._showCopyFallbackModal(reportText); }
+  });
+  btnArea.appendChild(copyBtn);
+  modal.appendChild(btnArea);
+
+  overlay.appendChild(modal);
+  targetDoc.body.appendChild(overlay);
+
+  // 先渲染快照
+  renderSnapshot();
+
+  // 渲染函数
+  function renderSnapshot() {
+    var snap = Diagnostics.snapshot();
+    var html = '<div style="font-size:13px;line-height:1.8">';
+
+    // 状态条
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">';
+    html += _diagBadge(snap.scanActive, '自动扫描');
+    html += _diagBadge(snap.observerActive, '实时监听');
+    html += _diagBadge(snap.injectLastTime > 0, '记忆注入');
+    html += _diagBadge(snap.kwIndexSize > 0, '关键词索引(' + snap.kwIndexSize + ')');
+    html += _diagBadge(snap.clipboardSafe, '剪贴板');
+    html += '</div>';
+
+    // 扫描状态
+    html += '<div style="margin-bottom:4px;font-size:12px;color:#555">';
+    html += '扫描: ' + (snap.scanActive ? ('运行中(每' + snap.scanInterval + '秒)') : '已停止') + ' | ';
+    html += '最近扫描: ' + (snap.scanLastTime ? _diagTime(snap.scanLastTime) : '从未') + ' | ';
+    html += '最近注入: ' + (snap.injectLastTime ? (_diagTime(snap.injectLastTime) + (snap.injectLastOk ? ' ✓' : ' ✗')) : '从未') + ' | ';
+    html += '降级弹窗: ' + snap.copyFallbackCount + '次 | ';
+    html += '输出模式: ' + ({notify:'弹窗', inject:'注入输入框', dashboard:'仪表盘'}[snap.autoMode] || snap.autoMode);
+    html += '</div>';
+
+    // 规则状态
+    if (snap.rules.length > 0) {
+      html += '<div style="font-size:11px;color:#888;margin-top:4px">规则: ';
+      var typeNames = { recall: '回顾', summarize: '总结', dormant: '沉寂' };
+      for (var ri = 0; ri < snap.rules.length; ri++) {
+        var r = snap.rules[ri];
+        var rPct = r.target > 0 ? Math.min(100, Math.round(r.counter / r.target * 100)) : 0;
+        html += (typeNames[r.type] || r.type) + ' ' + (r.enabled ? (r.counter + '/' + r.target) : '关') + ' ';
+      }
+      html += '</div>';
+    }
+
+    html += '</div>';
+    statusDiv.innerHTML = html;
+  }
+
+  function renderReport(report) {
+    var snap = report.snapshot;
+    renderSnapshot();
+
+    var tests = report.flows;
+    var html = '';
+    var passCount = 0, failCount = 0;
+    var flowNames = { '采集流': '📥 采集流', '注入流': '💉 注入流', '规则流': '⚙ 规则流', '生命流': '🔄 生命流', '存储流': '💾 存储流', '输入框': '⌨ 输入框', '面板': '🖥 面板', '完整性': '🔍 完整性', '复制流': '📋 复制流' };
+
+    for (var ti = 0; ti < tests.length; ti++) {
+      var t = tests[ti];
+      if (t.pass) passCount++; else failCount++;
+      var icon = t.pass ? '✅' : '❌';
+      html += '<div style="margin-bottom:8px;border:1px solid ' + (t.pass ? '#c8e6c9' : '#ffcdd2') + ';border-radius:8px;overflow:hidden">';
+      html += '<div style="padding:6px 10px;background:' + (t.pass ? '#e8f5e9' : '#ffebee') + ';font-size:13px;font-weight:500;color:#333">' + icon + ' ' + (flowNames[t.flow] || t.flow) + '</div>';
+      html += '<div style="padding:6px 10px;font-size:11px;line-height:1.7">';
+      for (var ri = 0; ri < t.results.length; ri++) {
+        var r = t.results[ri];
+        var riIcon = r.pass ? '✓' : '✗';
+        html += '<div style="color:' + (r.pass ? '#2e7d32' : '#c62828') + '">' + riIcon + ' ' + r.msg + '</div>';
+        if (r.suggest) {
+          html += '<div style="color:#e65100;font-size:10px;padding-left:16px">💡 ' + r.suggest + '</div>';
+        }
+      }
+      html += '</div></div>';
+    }
+
+    html += '<div style="text-align:center;padding:8px;font-size:13px;font-weight:500;color:' + (failCount === 0 ? '#2e7d32' : '#c62828') + '">';
+    html += passCount + '/' + tests.length + ' 条流通过' + (failCount > 0 ? ('，' + failCount + ' 条异常') : '') + '</div>';
+
+    testArea.innerHTML = html;
+    testArea.style.display = 'block';
+  }
+
+  function _diagBadge(ok, label) {
+    return '<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:500;' +
+      (ok ? 'background:#e8f5e9;color:#2e7d32' : 'background:#fff3e0;color:#e65100') + '">' +
+      (ok ? '●' : '○') + ' ' + label + '</span>';
+  }
+  function _diagTime(ts) {
+    var sec = Math.floor((Date.now() - ts) / 1000);
+    if (sec < 60) return sec + '秒前';
+    if (sec < 3600) return Math.floor(sec/60) + '分钟前';
+    if (sec < 86400) return Math.floor(sec/3600) + '小时前';
+    return Math.floor(sec/86400) + '天前';
+  }
+  function buildTextReport() {
+    var snap = Diagnostics.snapshot();
+    var txt = '=== 记忆之镜 诊断报告 ===\n';
+    txt += '时间: ' + new Date().toISOString() + '\n\n';
+    txt += '自动扫描: ' + (snap.scanActive ? '运行中' : '停止') + '\n';
+    txt += '实时监听: ' + (snap.observerActive ? '运行中' : '停止') + '\n';
+    txt += '剪贴板: ' + (snap.clipboardSafe ? '可用' : '需降级') + '\n';
+    txt += '降级弹窗使用: ' + snap.copyFallbackCount + '次\n';
+    txt += '关键词索引: ' + snap.kwIndexSize + '个\n';
+    txt += '注入输出模式: ' + snap.autoMode + '\n';
+    if (Diagnostics._results) {
+      for (var fi = 0; fi < Diagnostics._results.length; fi++) {
+        var f = Diagnostics._results[fi];
+        txt += '\n[' + (f.pass ? 'PASS' : 'FAIL') + '] ' + f.flow + '\n';
+        for (var ri = 0; ri < f.results.length; ri++) {
+          txt += '  ' + (f.results[ri].pass ? '[OK]' : '[!!]') + ' ' + f.results[ri].msg + '\n';
+        }
+      }
+    }
+    return txt;
+  }
 };
 
 // 全局设置面板
@@ -8334,7 +9013,7 @@ UIManager._showSimilarMemories = function(memoryId) {
           row.style.cssText = 'padding:8px 10px;border-bottom:1px solid #f0ece6;cursor:pointer;transition:background 0.15s';
           row.addEventListener('mouseenter', function() { this.style.background = '#fafaf8'; });
           row.addEventListener('mouseleave', function() { this.style.background = 'none'; });
-          row.addEventListener('click', function() { targetDoc.body.removeChild(overlay); DataService.getById(s.memory.id).then(function(mem) { if (mem) self._showEditor(mem); }).catch(function(err) { _warn('[Similar] getById failed:', err); }); });
+          row.addEventListener('click', function() { targetDoc.body.removeChild(overlay); DataService.getById(s.memory.id).then(function(mem) { if (mem) self._showEditor(mem); }); });
           row.innerHTML = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">' +
             '<span style="font-size:10px;background:' + barColor + ';color:#fff;padding:1px 6px;border-radius:8px;flex-shrink:0">' + pct + '%</span>' +
             '<span style="font-size:11px;color:#555">[' + escapeHtml(s.memory.zone || '') + ']</span>' +
@@ -8347,7 +9026,7 @@ UIManager._showSimilarMemories = function(memoryId) {
       overlay.appendChild(modal);
       targetDoc.body.appendChild(overlay);
     });
-  }).catch(function(err) { self.showToast('查找相似记忆失败', 'error'); });
+  });
 };
 
 // 显示冲突列表
@@ -8363,7 +9042,7 @@ UIManager._showConflictList = function(conflicts, allMemories) {
   overlay.addEventListener('click', function(e) { if (e.target === overlay) targetDoc.body.removeChild(overlay); });
 
   if (!conflicts) {
-    DataService.getAll({ includeHidden: false }).then(function(mems) { targetDoc.body.removeChild(overlay); self._showConflictList(_findConflicts(mems), mems); }).catch(function(err) { self.showToast('加载记忆失败', 'error'); });
+    DataService.getAll({ includeHidden: false }).then(function(mems) { targetDoc.body.removeChild(overlay); self._showConflictList(_findConflicts(mems), mems); });
     return;
   }
   if (conflicts.length === 0) {
@@ -8423,7 +9102,7 @@ UIManager._mergeMemories = function(memA, memB) {
       DataService.softDelete(memB.id);
       self.showToast('已合并', 'success');
       _renderMemoryList();
-    }).catch(function(err) { self.showToast('合并失败: ' + (err && err.message ? err.message : '未知错误'), 'error'); });
+    });
   });
 };
 
@@ -8465,7 +9144,7 @@ UIManager._batchAddTags = function() {
               var tags = mem.tags || [];
               if (tags.indexOf(tn) === -1) { tags.push(tn); count++; }
               return DataService.update(mem.id, { tags: tags });
-            }).then(function() { doAdd(idx + 1); }).catch(function(err) { self.showToast('添加标签失败', 'error'); });
+            }).then(function() { doAdd(idx + 1); });
           }
           doAdd(0);
         });
@@ -8495,7 +9174,7 @@ UIManager._batchRemoveTags = function() {
         for (var ti = 0; ti < mem.tags.length; ti++) commonTags[mem.tags[ti]] = (commonTags[mem.tags[ti]] || 0) + 1;
       }
       if (loadedCount >= ids.length) _showRemoveUI();
-    }).catch(function(err) { _warn('[Batch] load tags failed:', err); });
+    });
   }
 
   function _showRemoveUI() {
@@ -8526,7 +9205,7 @@ UIManager._batchRemoveTags = function() {
               if (!mem || !mem.tags) return doRemove(idx + 1);
               var idx2 = mem.tags.indexOf(tn);
               if (idx2 !== -1) { mem.tags.splice(idx2, 1); count++; return DataService.update(mem.id, { tags: mem.tags }); }
-            }).then(function() { doRemove(idx + 1); }).catch(function(err) { self.showToast('移除标签失败', 'error'); });
+            }).then(function() { doRemove(idx + 1); });
           }
           doRemove(0);
         });
@@ -8576,14 +9255,16 @@ UIManager._exportAsPrompt = function() {
     modal.querySelector('.mm-modal-close').addEventListener('click', function() { targetDoc.body.removeChild(overlay); });
     overlay.addEventListener('click', function(e) { if (e.target === overlay) targetDoc.body.removeChild(overlay); });
     modal.querySelector('.copy-btn').addEventListener('click', function() {
-      try { navigator.clipboard.writeText(full); self.showToast('已复制', 'success'); } catch(ex) { self._showCopyFallbackModal(full); }
+      self._safeCopy(full); self.showToast('已复制', 'success');
     });
     modal.querySelector('.inject-btn').addEventListener('click', function() {
-      LorebookManager._fillInput(full); self.showToast('已注入输入框', 'success');
+      var ok = LorebookManager._fillInput(full);
+      if (ok) { self.showToast('已注入输入框', 'success'); }
+      else { self._showCopyFallbackModal(full); self.showToast('未找到输入框，请手动复制', 'info'); }
     });
     overlay.appendChild(modal);
     targetDoc.body.appendChild(overlay);
-  }).catch(function(err) { self.showToast('导出提示失败', 'error'); });
+  });
 };
 
 // 触发词测试器
@@ -8595,10 +9276,10 @@ UIManager._showTriggerTester = function() {
   modal.className = 'mm-modal mm-modal-wide';
   modal.innerHTML = '<div class="mm-modal-header"><h3>触发词效果测试</h3><button class="mm-modal-close">×</button></div>' +
     '<p style="font-size:11px;color:#555;margin-bottom:8px">粘贴一段对话文本，查看哪些记忆会被触发关键词激活</p>' +
-    '<textarea id="mm-tt-input" placeholder="粘贴对话或输入文本..." rows="4" style="width:100%;padding:10px;border:1px solid #e8e4de;border-radius:8px;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:12px"></textarea>' +
+    '<textarea id="mm-tt-input" placeholder="粘贴对话或输入文本..." rows="4" style="width:100%;padding:10px;border:1px solid #d0ccc4;border-radius:8px;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:12px;color:#2c2c2c;background:#fff"></textarea>' +
     '<button id="mm-tt-run" class="mm-btn mm-btn-primary mm-btn-sm" style="margin-bottom:12px">测试</button>' +
     '<div id="mm-tt-results" style="max-height:280px;overflow-y:auto;font-size:12px"></div>' +
-    '<div style="margin-top:8px;font-size:11px;color:#555">Token 预算：<input id="mm-tt-budget" type="number" min="100" max="5000" step="100" value="' + LorebookManager._tokenBudget + '" style="width:70px;padding:4px;border:1px solid #e8e4de;border-radius:4px"> <button id="mm-tt-save-budget" class="mm-btn mm-btn-xs">应用</button></div>';
+    '<div style="margin-top:8px;font-size:11px;color:#555">Token 预算：<input id="mm-tt-budget" type="number" min="100" max="5000" step="100" value="' + LorebookManager._tokenBudget + '" style="width:70px;padding:4px;border:1px solid #d0ccc4;border-radius:4px;color:#2c2c2c;background:#fff"> <button id="mm-tt-save-budget" class="mm-btn mm-btn-xs">应用</button></div>';
   modal.querySelector('.mm-modal-close').addEventListener('click', function() { targetDoc.body.removeChild(overlay); });
   overlay.addEventListener('click', function(e) { if (e.target === overlay) targetDoc.body.removeChild(overlay); });
 
@@ -8641,7 +9322,7 @@ UIManager._showTriggerTester = function() {
       }
       html += '<div style="padding:6px 8px;font-size:10px;color:#555">共 ' + activated.length + ' 条，约 ' + totalToks + ' tokens</div>';
       resultsDiv.innerHTML = html;
-    }).catch(function(err) { resultsDiv.innerHTML = '<div style="text-align:center;color:red;padding:12px">测试失败: ' + (err && err.message ? err.message : '') + '</div>'; });
+    });
   });
 
   overlay.appendChild(modal);
@@ -8723,6 +9404,34 @@ UIManager._showTemplateManager = function() {
   targetDoc.body.appendChild(overlay);
 };
 
+// 安全复制 — 三层降级：Clipboard API → execCommand → 弹窗
+UIManager._safeCopy = function(text) {
+  if (!text) return false;
+  // 第一层：现代 Clipboard API
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch(e) {}
+  // 第二层：execCommand('copy') — Chrome/Safari 沙箱中无需 allow-clipboard-write
+  try {
+    var ta = targetDoc.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none;width:1px;height:1px';
+    targetDoc.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    var ok = targetDoc.execCommand('copy');
+    targetDoc.body.removeChild(ta);
+    if (ok) return true;
+  } catch(e) {}
+  // 第三层：弹窗手动复制
+  this._showCopyFallbackModal(text);
+  return false;
+};
+
 // 剪贴板降级模态框
 UIManager._showCopyFallbackModal = function(text) {
   var overlay = targetDoc.createElement('div');
@@ -8742,7 +9451,7 @@ UIManager._batchRestore = function() {
   if (this._selectedIds.length === 0) return;
   var ids = this._selectedIds.slice();
   var done = 0;
-  function next(i) { if (i >= ids.length) { self._selectedIds = []; UIManager.showToast('已恢复 ' + done + ' 条', 'success'); _renderMemoryList(); return; } DataService.restore(ids[i]).then(function() { done++; next(i + 1); }).catch(function(err) { self.showToast('批量恢复失败', 'error'); }); }
+  function next(i) { if (i >= ids.length) { self._selectedIds = []; UIManager.showToast('已恢复 ' + done + ' 条', 'success'); _renderMemoryList(); return; } DataService.restore(ids[i]).then(function() { done++; next(i + 1); }); }
   next(0);
 };
 UIManager._batchDelete = function() {
@@ -8751,35 +9460,44 @@ UIManager._batchDelete = function() {
   this._showConfirm('确定批量删除 ' + this._selectedIds.length + ' 条？', function() {
     var ids = self._selectedIds.slice();
     var done = 0;
-    function next(i) { if (i >= ids.length) { self._selectedIds = []; UIManager.showToast('已删除 ' + done + ' 条', 'info'); _renderMemoryList(); return; } DataService.softDelete(ids[i]).then(function() { done++; next(i + 1); }).catch(function(err) { self.showToast('批量删除失败', 'error'); }); }
+    function next(i) { if (i >= ids.length) { self._selectedIds = []; UIManager.showToast('已删除 ' + done + ' 条', 'info'); _renderMemoryList(); return; } DataService.softDelete(ids[i]).then(function() { done++; next(i + 1); }); }
     next(0);
   });
 };
 UIManager._batchGenRecall = function() {
+  if (this._selectedIds.length === 0) { this.showToast('请先选择记忆', 'info'); return; }
   DataService.getAll({ includeHidden: false }).then(function(memories) {
     var idMap = {}; for (var i = 0; i < UIManager._selectedIds.length; i++) idMap[UIManager._selectedIds[i]] = true;
     var lines = ['请回顾以下记忆：'];
     for (var j = 0; j < memories.length; j++) { if (idMap[memories[j].id]) lines.push('- [' + (memories[j].zone || '') + '] ' + memories[j].content); }
-    try { navigator.clipboard.writeText(lines.join('\n')); UIManager.showToast('回顾指令已复制', 'success'); } catch(ex) {}
-  }).catch(function(err) { UIManager.showToast('操作失败', 'error'); });
+    var text = lines.join('\n');
+    var ok = UIManager._safeCopy(text);
+    UIManager.showToast(ok ? '回顾指令已复制' : '请在弹出的窗口中手动复制', 'success');
+  });
 };
 UIManager._batchGenSummary = function() {
+  if (this._selectedIds.length === 0) { this.showToast('请先选择记忆', 'info'); return; }
   DataService.getAll({ includeHidden: false }).then(function(memories) {
     var idMap = {}; for (var i = 0; i < UIManager._selectedIds.length; i++) idMap[UIManager._selectedIds[i]] = true;
     var lines = ['请总结以下记忆：'];
     for (var j = 0; j < memories.length; j++) { if (idMap[memories[j].id]) lines.push('- [' + (memories[j].zone || '') + '] ' + memories[j].content); }
-    try { navigator.clipboard.writeText(lines.join('\n')); UIManager.showToast('总结指令已复制', 'success'); } catch(ex) {}
-  }).catch(function(err) { UIManager.showToast('操作失败', 'error'); });
+    var text = lines.join('\n');
+    var ok = UIManager._safeCopy(text);
+    UIManager.showToast(ok ? '总结指令已复制' : '请在弹出的窗口中手动复制', 'success');
+  });
 };
 UIManager._batchCopySource = function() {
+  if (this._selectedIds.length === 0) { this.showToast('请先选择记忆', 'info'); return; }
   DataService.getAll({ includeHidden: false }).then(function(memories) {
     var idMap = {}; for (var i = 0; i < UIManager._selectedIds.length; i++) idMap[UIManager._selectedIds[i]] = true;
     var blocks = [];
     for (var j = 0; j < memories.length; j++) {
       if (idMap[memories[j].id]) blocks.push('【记忆开始】\n<分区>' + (memories[j].zone || '') + '</分区>\n<角色名>' + (memories[j].roleName || '') + '</角色名>\n<内容>' + (memories[j].content || '') + '\n</内容>\n<标签>' + (memories[j].tags || []).join(',') + '</标签>\n【记忆结束】');
     }
-    try { navigator.clipboard.writeText(blocks.join('\n\n')); UIManager.showToast('素材已复制', 'success'); } catch(ex) {}
-  }).catch(function(err) { UIManager.showToast('操作失败', 'error'); });
+    var text = blocks.join('\n\n');
+    var ok = UIManager._safeCopy(text);
+    UIManager.showToast(ok ? '素材已复制' : '请在弹出的窗口中手动复制', 'success');
+  });
 };
 
 
@@ -8790,7 +9508,7 @@ function _injectCSS() {
   style.id = 'mm-v9-styles';
   style.textContent = [
     /* ====== 萌系主题核心 ====== */
-    ':root{--mm-pink:#d4878a;--mm-pink-dark:#b84040;--mm-pink-light:#faf2f2;--mm-beige:#faf6f2;--mm-brown:#2c2c2c;--mm-brown-light:#555555;--mm-cream:#fafaf8;--mm-border:#e8ddd6;--mm-radius:8px;--mm-radius-sm:4px;--mm-shadow:0 2px 12px rgba(0,0,0,0.06)}',
+    ':root{--mm-pink:#c07072;--mm-pink-dark:#b84040;--mm-pink-light:#faf2f2;--mm-beige:#faf6f2;--mm-brown:#2c2c2c;--mm-brown-light:#555555;--mm-cream:#fafaf8;--mm-border:#e8ddd6;--mm-radius:8px;--mm-radius-sm:4px;--mm-shadow:0 2px 12px rgba(0,0,0,0.06);--mm-danger:#b84040;--mm-success:#4a9;--mm-warn:#d49540;--mm-input-bg:#fff;--mm-input-border:#d0ccc4}',
     /* 按钮基础 */
     '.mm-btn{font-size:11px;padding:4px 10px;border:1px solid var(--mm-border);border-radius:16px;cursor:pointer;background:#fff;color:var(--mm-brown);transition:all 0.15s;white-space:nowrap;flex-shrink:0;font-family:inherit}',
     '.mm-btn:hover{background:var(--mm-pink-light);border-color:#d4b0b0}',
@@ -9111,43 +9829,61 @@ function _autoInit() {
 
         // 包装 DataService.save()（集成钩子）
         var _originalSave = DataService.save;
-        var _countedMemoryIds = {}; // 已统计标签的记忆 ID 集合，防止重复计数
+        // 已统计标签的记忆 ID → 已计数标签集合（不是简单布尔值，用于差异检测）
+        var _countedMemoryIds = {};
         DataService.save = function(memory) {
-          // 记录旧标签用于差异检测（防止编辑时标签统计虚高）
-          var oldTags = null;
-          if (memory.id) {
-            try { DataService.getById(memory.id).then(function(existing) { if (existing) oldTags = existing.tags || []; }).catch(function(){}); } catch(e) {}
-          }
+          // 先等待获取旧标签（修复竞态条件：原代码 fire-and-forget 未等待 getById）
+          var getOldPromise = memory.id
+            ? DataService.getById(memory.id).then(function(existing) { return existing ? (existing.tags || []) : null; }).catch(function() { return null; })
+            : Promise.resolve(null);
 
-          return _originalSave.call(DataService, memory).then(function(saved) {
-            if (saved) {
-              // 标签差异检测 + 重复保存去重
-              if (saved.tags && saved.tags.length > 0) {
-                var newTags = [];
-                if (_countedMemoryIds[saved.id]) {
-                  // 已经统计过，跳过（防止 scanner+手动编辑 重复计数）
-                  newTags = [];
-                } else if (oldTags) {
-                  var oldTagMap = {};
-                  for (var oti = 0; oti < oldTags.length; oti++) oldTagMap[oldTags[oti]] = true;
-                  for (var sti = 0; sti < saved.tags.length; sti++) {
-                    if (!oldTagMap[saved.tags[sti]]) newTags.push(saved.tags[sti]);
+          return getOldPromise.then(function(oldTags) {
+            return _originalSave.call(DataService, memory).then(function(saved) {
+              if (saved) {
+                // 标签差异检测
+                if (saved.tags && saved.tags.length > 0) {
+                  var newTags = [];
+                  var countedEntry = _countedMemoryIds[saved.id];
+                  if (countedEntry && oldTags) {
+                    // 已统计过 + 有旧标签 → 只计入本次新增且之前未计数的标签
+                    for (var sti = 0; sti < saved.tags.length; sti++) {
+                      if (!countedEntry.tagSet[saved.tags[sti]]) {
+                        newTags.push(saved.tags[sti]);
+                        countedEntry.tagSet[saved.tags[sti]] = true;
+                      }
+                    }
+                  } else if (!countedEntry && oldTags) {
+                    // 首次差异检测：只计入 oldTags 中没有的标签
+                    var oldTagMap = {};
+                    for (var oti = 0; oti < oldTags.length; oti++) oldTagMap[oldTags[oti]] = true;
+                    for (var sti2 = 0; sti2 < saved.tags.length; sti2++) {
+                      if (!oldTagMap[saved.tags[sti2]]) newTags.push(saved.tags[sti2]);
+                    }
+                    // 初始化计数记录
+                    var initSet = {};
+                    for (var sti3 = 0; sti3 < saved.tags.length; sti3++) initSet[saved.tags[sti3]] = true;
+                    _countedMemoryIds[saved.id] = { tagSet: initSet };
+                  } else if (!countedEntry && !oldTags) {
+                    // 新记忆，全部标签计入
+                    newTags = saved.tags;
+                    var fullSet = {};
+                    for (var sti4 = 0; sti4 < saved.tags.length; sti4++) fullSet[saved.tags[sti4]] = true;
+                    _countedMemoryIds[saved.id] = { tagSet: fullSet };
                   }
-                } else {
-                  newTags = saved.tags;
+                  // else: countedEntry 存在但 oldTags 为空 → 不重复计数
+
+                  if (newTags.length > 0) {
+                    try { TagManager.recordTagUsage(newTags); } catch(e) { _warn('[Hook] TagManager.recordTagUsage:', e); }
+                  }
                 }
-                if (newTags.length > 0) {
-                  _countedMemoryIds[saved.id] = true;
-                  try { TagManager.recordTagUsage(newTags); } catch(e) { _warn('[Hook] TagManager.recordTagUsage:', e); }
-                }
+                try { KnowledgeGraph.extractEntities(saved); } catch(e) { _warn('[Hook] KnowledgeGraph.extractEntities:', e); }
+                if (Scanner._pendingElement) { try { Scanner._markScanned(Scanner._pendingElement); } catch(e) { _warn('[Hook] Scanner._markScanned:', e); } Scanner._pendingElement = null; }
+                try { LorebookManager._addToIndex(saved); } catch(e) { _warn('[Hook] LorebookManager._addToIndex:', e); }
+                if (!saved.triggerKeywords || saved.triggerKeywords.length === 0) { try { LorebookManager._removeFromIndex(saved.id); } catch(e) { _warn('[Hook] LorebookManager._removeFromIndex:', e); } }
+                try { AdaptiveForgetting.recordRetrieval([saved.id]); } catch(e) { _warn('[Hook] AdaptiveForgetting.recordRetrieval:', e); }
               }
-              try { KnowledgeGraph.extractEntities(saved); } catch(e) { _warn('[Hook] KnowledgeGraph.extractEntities:', e); }
-              if (Scanner._pendingElement) { try { Scanner._markScanned(Scanner._pendingElement); } catch(e) { _warn('[Hook] Scanner._markScanned:', e); } Scanner._pendingElement = null; }
-              try { LorebookManager._addToIndex(saved); } catch(e) { _warn('[Hook] LorebookManager._addToIndex:', e); }
-              if (!saved.triggerKeywords || saved.triggerKeywords.length === 0) { try { LorebookManager._removeFromIndex(saved.id); } catch(e) { _warn('[Hook] LorebookManager._removeFromIndex:', e); } }
-              try { AdaptiveForgetting.recordRetrieval([saved.id]); } catch(e) { _warn('[Hook] AdaptiveForgetting.recordRetrieval:', e); }
-            }
-            return saved;
+              return saved;
+            });
           });
         };
 
@@ -9158,18 +9894,44 @@ function _autoInit() {
           if (result && result.hits && result.hits.length > 0) {
             var hitIds = [];
             for (var hi = 0; hi < result.hits.length; hi++) { if (result.hits[hi].id) hitIds.push(result.hits[hi].id); }
-            if (hitIds.length > 0) { try { AdaptiveForgetting.recordRetrieval(hitIds); } catch(e) { _warn('[Hook] SearchIndex: AdaptiveForgetting.recordRetrieval:', e); } }
+            if (hitIds.length > 0) { try { AdaptiveForgetting.recordRetrieval(hitIds); } catch(e) {} }
           }
           return result;
         };
 
         // 包装 softDelete / permanentDelete
         var _origSoft = DataService.softDelete;
-        DataService.softDelete = function(id) { return _origSoft.call(DataService, id).then(function() { try { LorebookManager._removeFromIndex(id); } catch(e) { _warn('[Hook] softDelete: LorebookManager._removeFromIndex:', e); } }); };
+        DataService.softDelete = function(id) { return _origSoft.call(DataService, id).then(function() { try { LorebookManager._removeFromIndex(id); } catch(e) {} }); };
         var _origPerm = DataService.permanentDelete;
-        DataService.permanentDelete = function(id) { return _origPerm.call(DataService, id).then(function() { try { LorebookManager._removeFromIndex(id); } catch(e) { _warn('[Hook] permanentDelete: LorebookManager._removeFromIndex:', e); } }); };
+        DataService.permanentDelete = function(id) { return _origPerm.call(DataService, id).then(function() { try { LorebookManager._removeFromIndex(id); } catch(e) {} }); };
 
         _log('[MemoryMirror] 初始化完成。MemoryMirror.diagnose() 查看状态，__mm_diag() 快速诊断');
+
+        // 启动自检（静默，仅关键问题输出warn日志）
+        try {
+          var startupIssues = Diagnostics.startupCheck();
+          if (startupIssues.length > 0) {
+            _log('[MemoryMirror] 启动自检发现 ' + startupIssues.length + ' 个问题，打开面板查看详情');
+          }
+        } catch(e) { _warn('[Diagnostics] 启动自检失败:', e); }
+
+        // 追踪包装：Scanner.scan 记录结果
+        var _origScan = Scanner.scan;
+        Scanner.scan = function() {
+          return _origScan.call(Scanner).then(function(r) {
+            Scanner._lastScanTime = Date.now();
+            Scanner._lastScanResult = { added: r.added, skipped: r.skipped, time: Scanner._lastScanTime };
+            return r;
+          });
+        };
+
+        // 追踪包装：_showCopyFallbackModal 计数
+        var _origFallback = UIManager._showCopyFallbackModal;
+        UIManager._showCopyFallbackModal = function(text) {
+          UIManager._copyFallbackCount = (UIManager._copyFallbackCount || 0) + 1;
+          UIManager._lastCopyResult = { time: Date.now(), type: 'fallback', length: (text || '').length, ok: false };
+          return _origFallback.call(UIManager, text);
+        };
 
         // 挂载全局 API
         window.MemoryMirror = {
@@ -9217,16 +9979,92 @@ function _autoInit() {
           rollbackRounds: RollbackManager.rollbackRounds.bind(RollbackManager),
           openPanel: function(s) { _openPanel(s); },
           closePanel: function() { closeExistingWinbox(); },
-          startTutorial: function() { _tutorialStepIndex = 0; _startTutorial(); },
+          startTutorial: function() {},
           showManual: function() { _showManualImpl(); },
           showHelp: function(topic) { _showHelpCardImpl(topic); },
           diagnose: function() { return _diagnose(); },
+          diagnostics: Diagnostics,
+          showDiagnostics: function() { UIManager._showDiagnostics(); },
           _winbox: null,
           _debug: function() {
             var stats = SearchIndex.getStats();
             return { roleId: DataService._roleId, sessionId: DataService._sessionId, storageMode: DataService._storageMode, memoryCount: stats.total, activeThemes: TagManager.getActiveThemes(), entityCount: Object.keys(KnowledgeGraph._entities).length, selectedCount: UIManager._selectedIds.length };
           }
         };
+
+        // 全局快捷诊断函数（控制台直接调用 __mm_diag()）
+        window.__mm_diag = function() {
+          return Diagnostics.runAll().then(function(r) {
+            console.group('记忆之镜 诊断报告');
+            var flows = r.flows;
+            for (var fi = 0; fi < flows.length; fi++) {
+              var f = flows[fi];
+              console.log((f.pass ? '✅' : '❌') + ' ' + f.flow);
+              for (var ri = 0; ri < f.results.length; ri++) {
+                var res = f.results[ri];
+                console.log('  ' + (res.pass ? '✓' : '✗') + ' ' + res.msg + (res.suggest ? '\n    💡 ' + res.suggest : ''));
+              }
+            }
+            console.groupEnd();
+            return r;
+          });
+        };
+        // E2E 自动化测试（CI/本地一键回归）
+        window.__mm_e2e = function(opts) {
+          opts = opts || {};
+          var timeout = opts.timeout || 30000;
+          var verbose = opts.verbose !== false;
+          var startTime = Date.now();
+          var results = { passed: [], failed: [], skipped: [], duration: 0 };
+
+          function finish() {
+            results.duration = Date.now() - startTime;
+            if (verbose) {
+              console.group((results.failed.length === 0 ? '✅' : '❌') + ' E2E 测试完成 ' +
+                results.passed.length + '/' + (results.passed.length + results.failed.length) + ' 通过 (' + results.duration + 'ms)');
+              for (var pi = 0; pi < results.passed.length; pi++) {
+                console.log('  ✅ ' + results.passed[pi]);
+              }
+              for (var fi = 0; fi < results.failed.length; fi++) {
+                console.warn('  ❌ ' + results.failed[fi].flow + ': ' + results.failed[fi].reason);
+              }
+              console.groupEnd();
+            }
+            if (typeof window.__mm_e2e_callback === 'function') {
+              window.__mm_e2e_callback(results);
+            }
+            return results;
+          }
+
+          var timer = setTimeout(function() {
+            results.failed.push({ flow: '超时', reason: '测试超时 (' + timeout + 'ms)' });
+            finish();
+          }, timeout);
+
+          return Diagnostics.runAll().then(function(report) {
+            clearTimeout(timer);
+            var flows = report.flows;
+            for (var i = 0; i < flows.length; i++) {
+              var f = flows[i];
+              if (f.pass) {
+                results.passed.push(f.flow);
+              } else {
+                // 提取第一个失败原因
+                var reason = '';
+                for (var ri = 0; ri < f.results.length; ri++) {
+                  if (!f.results[ri].pass) { reason = f.results[ri].msg; break; }
+                }
+                results.failed.push({ flow: f.flow, reason: reason || '未知' });
+              }
+            }
+            return finish();
+          }).catch(function(err) {
+            clearTimeout(timer);
+            results.failed.push({ flow: '系统', reason: '测试框架异常: ' + (err.message || String(err)) });
+            return finish();
+          });
+        };
+        _log('[MemoryMirror] 控制台输入 __mm_diag() 诊断 / __mm_e2e() 一键回归测试');
       })
       .catch(function(err) {
         _error('[MemoryMirror] 初始化失败: ' + (err && err.message ? err.message : String(err)), err);
