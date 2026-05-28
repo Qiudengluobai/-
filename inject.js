@@ -7376,7 +7376,7 @@ function _renderMD(text) {
   t = t.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   t = t.replace(/\*(.+?)\*/g, '<em>$1</em>');
   t = t.replace(/~~(.+?)~~/g, '<del>$1</del>');
-  t = t.replace(/`([^`]+)`/g, '<code style="background:#f3f0ea;padding:1px 4px;border-radius:2px;font-size:12px">$1</code>');
+  t = t.replace(/`([^`]+)`/g, '<code style="background:#f3f0ea;padding:1px 4px;border-radius:2px;font-size:12px;color:#2c2c2c">$1</code>');
   t = t.replace(/^### (.+)$/gm, '<h4 style="font-size:14px;margin:6px 0 4px;color:#2c2c2c">$1</h4>');
   t = t.replace(/^## (.+)$/gm, '<h3 style="font-size:15px;margin:6px 0 4px;color:#2c2c2c">$1</h3>');
   t = t.replace(/^# (.+)$/gm, '<h2 style="font-size:16px;margin:6px 0 4px;color:#2c2c2c">$1</h2>');
@@ -7533,12 +7533,12 @@ UIManager._showEditor = function(memory) {
   modal.className = 'mirror-modal';
   modal.style.cssText = 'background:#fff;border-radius:4px;padding:20px 24px;max-width:560px;width:94%;max-height:85vh;overflow-y:auto;box-shadow:0 4px 20px rgba(0,0,0,0.1)';
   modal.innerHTML =
-    '<h3 style="margin:0 0 12px">编辑记忆</h3>' +
-    '<select id="mm-ed-zone" style="width:100%;padding:6px;margin-bottom:6px;border:1px solid #e8e4de;border-radius:2px">' + ZONES.map(function(z) { return '<option' + (z === memory.zone ? ' selected' : '') + '>' + z + '</option>'; }).join('') + '</select>' +
+    '<h3 style="margin:0 0 12px;color:#2c2c2c">编辑记忆</h3>' +
+    '<select id="mm-ed-zone" style="width:100%;padding:6px;margin-bottom:6px;border:1px solid #e8e4de;border-radius:2px;color:#2c2c2c;background:#fff">' + ZONES.map(function(z) { return '<option' + (z === memory.zone ? ' selected' : '') + '>' + z + '</option>'; }).join('') + '</select>' +
     '<textarea id="mm-ed-content" rows="5" style="width:100%;padding:8px;border:1px solid #e8e4de;border-radius:2px;font-size:13px;resize:vertical;box-sizing:border-box;color:#2c2c2c;background:#fff">' + escapeHtml(memory.content || '') + '</textarea>' +
     '<div style="display:flex;gap:6px;margin-top:6px"><input id="mm-ed-rolename" placeholder="角色名" value="' + escapeHtml(memory.roleName || '') + '" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px;color:#2c2c2c;background:#fff"><input id="mm-ed-category" placeholder="分类" value="' + escapeHtml(memory.category || '') + '" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px;color:#2c2c2c;background:#fff"></div>' +
-    '<input id="mm-ed-tags" placeholder="标签（逗号分隔）" value="' + escapeHtml((memory.tags || []).join(', ')) + '" style="width:100%;padding:6px;margin-top:6px;border:1px solid #e8e4de;border-radius:2px;box-sizing:border-box">' +
-    '<div style="display:flex;gap:4px;margin-top:6px"><input id="mm-ed-triggers" placeholder="触发关键词（逗号分隔）" value="' + escapeHtml((memory.triggerKeywords || []).join(', ')) + '" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px;box-sizing:border-box"><button id="mm-ed-suggest-triggers" class="mm-btn mm-btn-xs" style="flex-shrink:0" title="从标签和内容自动推荐触发词">推荐</button></div>' +
+    '<input id="mm-ed-tags" placeholder="标签（逗号分隔）" value="' + escapeHtml((memory.tags || []).join(', ')) + '" style="width:100%;padding:6px;margin-top:6px;border:1px solid #e8e4de;border-radius:2px;box-sizing:border-box;color:#2c2c2c;background:#fff">' +
+    '<div style="display:flex;gap:4px;margin-top:6px"><input id="mm-ed-triggers" placeholder="触发关键词（逗号分隔）" value="' + escapeHtml((memory.triggerKeywords || []).join(', ')) + '" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px;box-sizing:border-box;color:#2c2c2c;background:#fff"><button id="mm-ed-suggest-triggers" class="mm-btn mm-btn-xs" style="flex-shrink:0" title="从标签和内容自动推荐触发词">推荐</button></div>' +
     '<div style="display:flex;gap:6px;margin-top:6px"><select id="mm-ed-importance" style="flex:1;padding:6px;border:1px solid #e8e4de;border-radius:2px;color:#2c2c2c;background:#fff">' + [1,2,3,4,5].map(function(v) { return '<option' + (v === (memory.importance||3) ? ' selected' : '') + '>' + v + '</option>'; }).join('') + '</select></div>' +
     '<label style="display:flex;align-items:center;gap:4px;margin-top:6px;font-size:12px;color:#2c2c2c"><input id="mm-ed-protected" type="checkbox"' + (memory.protected ? ' checked' : '') + '> 保护状态</label>' +
     '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px"><button id="mm-ed-cancel" class="mm-btn">取消</button><button id="mm-ed-save" class="mm-btn mm-btn-primary">保存</button></div>';
@@ -9314,7 +9314,7 @@ UIManager._showTriggerTester = function() {
         var tok = estimateTokens(a.memory.content || '');
         totalToks += tok;
         html += '<div style="padding:6px 8px;border-bottom:1px solid #f0ece6">' +
-          '<span style="font-size:10px;background:#f3f0ea;padding:1px 6px;border-radius:8px">命中 ' + a.hits + ' 次</span> ' +
+          '<span style="font-size:10px;background:#f3f0ea;padding:1px 6px;border-radius:8px;color:#333">命中 ' + a.hits + ' 次</span> ' +
           '<span style="font-size:10px;color:#555">重要性 ' + (a.memory.importance || 3) + '</span> ' +
           '<span style="font-size:10px;color:#555">约 ' + tok + ' tokens</span>' +
           '<div style="margin-top:2px;font-size:12px;color:#2c2c2c">' + escapeHtml((a.memory.content || '').substring(0, 100)) + '</div>' +
